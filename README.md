@@ -1,1 +1,1 @@
-# PayTrix-bot
+Standardised Code for my propriotory bot.
