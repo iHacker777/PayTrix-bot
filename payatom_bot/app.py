@@ -5,6 +5,7 @@ import logging
 
 from telegram.ext import ApplicationBuilder, Application
 
+from .cipherbank_client import initialize_cipherbank_client, shutdown_cipherbank_client
 from .config import load_settings
 from .handlers.core import register_core_handlers
 from .handlers.aliases import register_alias_handlers
@@ -59,6 +60,35 @@ async def post_init(application: Application) -> None:
     else:
         logger.warning("⚠️ Balance monitor not initialized")
 
+    # Initialize CipherBank client
+    settings = application.bot_data.get("settings")
+    messenger = application.bot_data.get("messenger")
+    
+    if settings and settings.cipherbank_url and settings.cipherbank_username:
+        try:
+            logger.info("Initializing CipherBank client...")
+            cipherbank_client = initialize_cipherbank_client(
+                base_url=settings.cipherbank_url,
+                username=settings.cipherbank_username,
+                password=settings.cipherbank_password,
+                messenger=messenger,
+            )
+            application.bot_data["cipherbank_client"] = cipherbank_client
+            logger.info("✅ CipherBank client initialized and started")
+        except Exception as e:
+            logger.error("❌ Failed to initialize CipherBank client: %s", e)
+            if messenger:
+                messenger.send_event(
+                    f"❌ <b>CipherBank Initialization Failed</b>\n\n"
+                    f"Error: {type(e).__name__}: {str(e)}\n\n"
+                    f"CipherBank uploads will be skipped.\n"
+                    f"Check CIPHERBANK_* settings in .env file.",
+                    kind="ERROR"
+                )
+    else:
+        logger.info("ℹ️ CipherBank integration disabled (missing configuration)")
+    #  END OF ADDED SECTION
+
 async def post_shutdown(application: Application) -> None:
     """Called before the application shuts down."""
     logger.info("Starting shutdown tasks...")
@@ -68,6 +98,14 @@ async def post_shutdown(application: Application) -> None:
     if balance_monitor:
         await balance_monitor.stop()
         logger.info("✅ Balance monitor stopped")
+
+    # Shutdown CipherBank client
+    try:
+        shutdown_cipherbank_client()
+        logger.info("✅ CipherBank client stopped")
+    except Exception as e:
+        logger.error("Error stopping CipherBank client: %s", e)
+    #  END OF ADDED SECTION
 
 def main() -> None:
     logging.basicConfig(

@@ -24,6 +24,7 @@ from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, ElementClickInterceptedException
 
+from ..cipherbank_client import get_cipherbank_client 
 from ..worker_base import BaseWorker
 from ..captcha_solver import TwoCaptcha
 from ..autobank_client import AutoBankClient
@@ -451,35 +452,60 @@ class IOBWorker(BaseWorker):
             if not csv_path:
                 raise TimeoutException("Timed out waiting for IOB CSV download")
             self.info(f"📥 Downloaded CSV: {os.path.basename(csv_path)}")
+        time.sleep(5)    
 
         # 9) Upload to AutoBank in a new tab
-        original_handle = d.current_window_handle
+        # original_handle = d.current_window_handle
         
-        with ErrorContext("opening AutoBank upload tab", messenger=self.msgr, alias=self.alias):
-            d.execute_script("window.open('about:blank');")
-            autobank_handle = [h for h in d.window_handles if h != original_handle][-1]
+        # with ErrorContext("opening AutoBank upload tab", messenger=self.msgr, alias=self.alias):
+            # d.execute_script("window.open('about:blank');")
+            # autobank_handle = [h for h in d.window_handles if h != original_handle][-1]
 
-        max_attempts = 5
-        for attempt in range(1, max_attempts + 1):
-            with ErrorContext(
-                f"uploading to AutoBank (attempt {attempt}/{max_attempts})",
-                messenger=self.msgr,
-                alias=self.alias,
-                reraise=(attempt == max_attempts)
-            ):
-                d.switch_to.window(autobank_handle)
-                AutoBankClient(d).upload("IOB", acct_no, csv_path)
-                self.info(f"✅ AutoBank upload succeeded (attempt {attempt}/{max_attempts})")
-                break
+        # max_attempts = 5
+        # for attempt in range(1, max_attempts + 1):
+            # with ErrorContext(
+                # f"uploading to AutoBank (attempt {attempt}/{max_attempts})",
+                # messenger=self.msgr,
+                # alias=self.alias,
+                # reraise=(attempt == max_attempts)
+            # ):
+                # d.switch_to.window(autobank_handle)
+                # AutoBankClient(d).upload("IOB", acct_no, csv_path)
+                # self.info(f"✅ AutoBank upload succeeded (attempt {attempt}/{max_attempts})")
+                # break
 
         # 10) Return to IOB tab
-        with ErrorContext("closing upload tab", messenger=self.msgr, alias=self.alias, reraise=False):
-            d.switch_to.window(original_handle)
-            for h in list(d.window_handles):
-                if h != original_handle:
-                    d.switch_to.window(h)
-                    d.close()
-            d.switch_to.window(original_handle)
+        # with ErrorContext("closing upload tab", messenger=self.msgr, alias=self.alias, reraise=False):
+            # d.switch_to.window(original_handle)
+            # for h in list(d.window_handles):
+                # if h != original_handle:
+                    # d.switch_to.window(h)
+                    # d.close()
+            # d.switch_to.window(original_handle)
+
+    # ============================================================
+    #  11) Upload to CipherBank (NEW)
+    # ============================================================
+    cipherbank = get_cipherbank_client()
+    if cipherbank:
+        for attempt in range(1, max_attempts + 1):
+            try:
+                cipherbank.upload_statement(
+                    bank_code=self.cred["bank_label"],
+                    account_number=self.cred["account_number"],
+                    file_path=csv_path,
+                    alias=self.alias,
+                )
+                self.info(f"✅ CipherBank upload succeeded (attempt {attempt}/{max_attempts})")
+                break
+            except Exception as e:
+                self.error(f"⚠️ CipherBank upload failed (attempt {attempt}/{max_attempts}): {type(e).__name__}: {e}")
+                if attempt == max_attempts:
+                    # Don't crash worker - CipherBank is optional
+                    self.error("❌ CipherBank upload failed after all retries - continuing with next cycle")
+                    break
+                time.sleep(2)
+    # END OF ADDED SECTION
 
     def _balance_enquiry(self) -> None:
         """
@@ -489,9 +515,9 @@ class IOBWorker(BaseWorker):
         d = self.driver
 
         # Make sure we're on the IOB tab
-        if self.iob_win:
-            with ErrorContext("switching to IOB window", messenger=self.msgr, alias=self.alias):
-                d.switch_to.window(self.iob_win)
+        # if self.iob_win:
+            # with ErrorContext("switching to IOB window", messenger=self.msgr, alias=self.alias):
+                # d.switch_to.window(self.iob_win)
 
         # Scroll back to top
         with ErrorContext("scrolling to top", messenger=self.msgr, alias=self.alias, reraise=False):

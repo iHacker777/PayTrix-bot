@@ -13,6 +13,11 @@ class Settings:
     credentials_csv: str
     two_captcha_key: str
     autobank_upload_url: str
+    
+    cipherbank_url: str = ""
+    cipherbank_username: str = ""
+    cipherbank_password: str = ""
+
     max_profiles: int = 10
     profile_root: str = field(default_factory=lambda: os.path.join(os.path.expanduser("~"), "chrome-profiles"))
     
@@ -81,6 +86,15 @@ def load_settings() -> Settings:
             "Make sure to create it before running workers.",
             creds_csv
         )
+    # CipherBank configuration
+    cipherbank_url = os.environ.get("CIPHERBANK_URL", "").strip()
+    cipherbank_username = os.environ.get("CIPHERBANK_USERNAME", "").strip()
+    cipherbank_password = os.environ.get("CIPHERBANK_PASSWORD", "").strip()
+    
+    if cipherbank_url and cipherbank_username and cipherbank_password:
+        logger.info("✅ CipherBank integration enabled: %s", cipherbank_url)
+    else:
+        logger.info("⚠️ CipherBank integration disabled (configuration incomplete)")
     
     # Parse balance alert group IDs
     alert_group_ids = []
@@ -118,12 +132,14 @@ def load_settings() -> Settings:
         "  - Chat ID: %s\n"
         "  - Credentials CSV: %s\n"
         "  - AutoBank URL: %s\n"
+        "  - CipherBank: %s\n"  # NEW
         "  - 2Captcha: %s\n"
         "  - Balance Alerts: %s\n"
         "  - Check Interval: %d seconds",
         chat_id,
         creds_csv,
         autobank_url,
+        "enabled" if cipherbank_url else "disabled",  # NEW
         "configured" if two_captcha else "not configured",
         "enabled" if alert_group_ids else "disabled",
         check_interval
@@ -135,6 +151,9 @@ def load_settings() -> Settings:
         credentials_csv=creds_csv,
         two_captcha_key=two_captcha,
         autobank_upload_url=autobank_url,
+        cipherbank_url=cipherbank_url,            # NEW
+        cipherbank_username=cipherbank_username,  # NEW
+        cipherbank_password=cipherbank_password,  # NEW
         alert_group_ids=alert_group_ids,
         balance_check_interval=check_interval,
     )
