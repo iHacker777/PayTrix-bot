@@ -29,6 +29,16 @@ from .error_handler import (
 
 logger = logging.getLogger(__name__)
 
+# Bank code to parser key mapping
+PARSER_KEY_MAP = {
+    "IOB": "iob",
+    "IOB CORPORATE": "iob",
+    "TMB": "tmb",
+    "KGB": "kgb",
+    "IDBI": "idbi",
+    "IDFC": "idfc",
+    "CANARA": "canara",
+}
 
 class CipherBankClient:
     """
@@ -507,12 +517,16 @@ class CipherBankClient:
             try:
                 with open(file_path, 'rb') as f:
                     file_name = os.path.basename(file_path)
+                    # Get parser key from mapping, fallback to bank_code
+                    parser_key = PARSER_KEY_MAP.get(bank_code, bank_code)
+
                     files = {
                         'file': (file_name, f, 'application/octet-stream')
                     }
                     data = {
                         'bankCode': bank_code,
                         'accountNumber': account_number,
+                        'parserKey': parser_key,  # 🔹 ADDED
                     }
                     headers = {
                         'Authorization': f'Bearer {token}',
