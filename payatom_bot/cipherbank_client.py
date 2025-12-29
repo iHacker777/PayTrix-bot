@@ -190,7 +190,10 @@ class CipherBankClient:
         """Get user information from last login (thread-safe)."""
         with self._lock:
             return self._user_info.copy()
-    
+    def get_username(self) -> str:
+        """Get authenticated username (thread-safe)."""
+        with self._lock:
+            return self._user_info.get("username", "")
     def _perform_login(self) -> None:
         """
         Perform login to CipherBank and store token.
@@ -519,14 +522,22 @@ class CipherBankClient:
                     file_name = os.path.basename(file_path)
                     # Get parser key from mapping, fallback to bank_code
                     parser_key = PARSER_KEY_MAP.get(bank_code, bank_code)
-
+                    # Get authenticated username
+                    username = self.get_username()
+                    if not username:
+                        logger.warning(
+                            "[%s] No username available for upload - using default",
+                            alias
+                        )
+                        username = self.username  # Fallback to login username
                     files = {
                         'file': (file_name, f, 'application/octet-stream')
                     }
                     data = {
                         'bankCode': bank_code,
                         'accountNumber': account_number,
-                        'parserKey': parser_key,  # 🔹 ADDED
+                        'parserKey': parser_key,  # ADDED
+                        'username': username, 
                     }
                     headers = {
                         'Authorization': f'Bearer {token}',
