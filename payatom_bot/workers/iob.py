@@ -449,6 +449,7 @@ class IOBWorker(BaseWorker):
                 d.execute_script("arguments[0].click();", csv_btn)
 
         # 8) Wait for CSV download
+        time.sleep(3)
         with ErrorContext("waiting for CSV download", messenger=self.msgr, alias=self.alias):
             csv_path = self.wait_newest_file(".csv", timeout=60.0)
             if not csv_path:
