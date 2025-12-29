@@ -61,14 +61,20 @@ async def post_init(application: Application) -> None:
         logger.warning("⚠️ Balance monitor not initialized")
 
     # Initialize CipherBank client
+    # CHANGED: Initialize CipherBank client with two URLs
     settings = application.bot_data.get("settings")
     messenger = application.bot_data.get("messenger")
     
-    if settings and settings.cipherbank_url and settings.cipherbank_username:
+    if (settings and 
+        settings.cipherbank_auth_url and 
+        settings.cipherbank_upload_url and 
+        settings.cipherbank_username and 
+        settings.cipherbank_password):
         try:
             logger.info("Initializing CipherBank client...")
             cipherbank_client = initialize_cipherbank_client(
-                base_url=settings.cipherbank_url,
+                auth_base_url=settings.cipherbank_auth_url,      # 🔹 CHANGED
+                upload_base_url=settings.cipherbank_upload_url,  # 🔹 CHANGED
                 username=settings.cipherbank_username,
                 password=settings.cipherbank_password,
                 messenger=messenger,
@@ -82,7 +88,7 @@ async def post_init(application: Application) -> None:
                     f"❌ <b>CipherBank Initialization Failed</b>\n\n"
                     f"Error: {type(e).__name__}: {str(e)}\n\n"
                     f"CipherBank uploads will be skipped.\n"
-                    f"Check CIPHERBANK_* settings in .env file.",
+                    f"Check CIPHERBANK_AUTH_URL, CIPHERBANK_UPLOAD_URL, and credentials in .env file.",  # 🔹 CHANGED message
                     kind="ERROR"
                 )
     else:

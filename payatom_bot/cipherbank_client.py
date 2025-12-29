@@ -46,7 +46,8 @@ class CipherBankClient:
     
     def __init__(
         self,
-        base_url: str,
+        auth_base_url: str,      # CHANGED: was just base_url
+        upload_base_url: str,    # NEW: separate domain for uploads
         username: str,
         password: str,
         messenger,
@@ -60,7 +61,8 @@ class CipherBankClient:
             password: Authentication password
             messenger: Messenger instance for alerts (uses existing system)
         """
-        self.base_url = base_url.rstrip('/')
+        self.auth_base_url = auth_base_url.rstrip('/')      # 🔹 CHANGED
+        self.upload_base_url = upload_base_url.rstrip('/')  # 🔹 NEW
         self.username = username
         self.password = password
         self.msgr = messenger
@@ -77,7 +79,12 @@ class CipherBankClient:
         self._refresh_failures = 0
         self._max_failures = 5
         
-        logger.info("CipherBank client initialized for user: %s at %s", username, base_url)
+        logger.info(
+            "CipherBank client initialized for user: %s (auth: %s, upload: %s)",
+            username,
+            self.auth_base_url,
+            self.upload_base_url
+        )
     
     def start(self) -> None:
         """
@@ -113,8 +120,9 @@ class CipherBankClient:
                 self.msgr.send_event(
                     f"✅ <b>CipherBank Connected</b>\n\n"
                     f"<b>User:</b> {self.username}\n"
-                    f"<b>Token valid until:</b> {self._get_expiry_str()}\n"
-                    f"<b>API:</b> {self.base_url}",
+                    f"<b>Token valid until:</b> {self._get_expiry_str()}\n"  # 🔹 ADD THIS
+                    f"<b>Auth API:</b> {self.auth_base_url}\n"
+                    f"<b>Upload API:</b> {self.upload_base_url}",
                     kind="START"
                 )
     
@@ -181,7 +189,7 @@ class CipherBankClient:
         Raises:
             RuntimeError: If login fails
         """
-        url = f"{self.base_url}/auth/login"
+        url = f"{self.auth_base_url}/auth/login"
         payload = {
             "username": self.username,
             "password": self.password,
@@ -210,7 +218,7 @@ class CipherBankClient:
             
             if response is None:
                 error = RuntimeError(
-                    f"Failed to connect to CipherBank at {self.base_url}\n"
+                    f"Failed to connect to CipherBank at {self.auth_base_url}\n"  # 🔹 CHANGED
                     "Please check:\n"
                     "• Network connectivity\n"
                     "• CipherBank URL is correct\n"
@@ -459,7 +467,7 @@ class CipherBankClient:
             alias=alias,
             reraise=True
         ):
-            url = f"{self.base_url}/statements/upload"
+            url = f"{self.upload_base_url}/statements/upload"  # CHANGED
             
             # Validate file exists before attempting upload
             if not os.path.exists(file_path):
@@ -719,7 +727,8 @@ def get_cipherbank_client() -> Optional[CipherBankClient]:
 
 
 def initialize_cipherbank_client(
-    base_url: str,
+    auth_base_url: str,      # CHANGED: was base_url
+    upload_base_url: str,    # NEW
     username: str,
     password: str,
     messenger,
@@ -728,7 +737,8 @@ def initialize_cipherbank_client(
     Initialize global CipherBank client with comprehensive error handling.
     
     Args:
-        base_url: CipherBank API base URL
+        auth_base_url: CipherBank auth API base URL (e.g., https://testing.thepaytrix.com/api)
+        upload_base_url: CipherBank upload API base URL (e.g., https://cipher.thepaytrix.com/api)
         username: Authentication username
         password: Authentication password
         messenger: Messenger instance for alerts
@@ -757,7 +767,8 @@ def initialize_cipherbank_client(
                 )
             
             _global_client = CipherBankClient(
-                base_url=base_url,
+                auth_base_url=auth_base_url,      # CHANGED
+                upload_base_url=upload_base_url,  # NEW
                 username=username,
                 password=password,
                 messenger=messenger,
