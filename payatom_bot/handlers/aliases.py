@@ -4,6 +4,7 @@ Enterprise-grade alias management handlers for PayTrix Bot.
 This module provides Telegram command handlers for managing bank account credentials:
 - /list, /aliases: Display all configured accounts with masked details
 - /add: Create new account credentials
+- /view: Securely view full credential details (with auto-deletion)
 - /edit: Interactive credential modification
 - /delete: Remove account credentials (future)
 
@@ -14,12 +15,16 @@ Features:
 - Input validation and sanitization
 - Integration with encrypted credential storage
 - Professional error handling and reporting
+- Secure credential viewing with auto-deletion
 
 Security:
-- Passwords never echoed back to users
-- Account numbers masked in all outputs
+- Passwords never echoed back to users (except in /view with confirmation)
+- Account numbers masked in all outputs (except /view)
+- /view command requires explicit confirmation
+- Sensitive messages auto-delete after 60 seconds
 - Audit trail for all credential operations
 - Secure file permission validation
+- Telegram spoiler tags for password masking
 """
 from __future__ import annotations
 
@@ -62,6 +67,12 @@ logger = logging.getLogger(__name__)
 
 # Tracks ongoing edit operations: chat_id -> {"alias": ..., "field": ..., "label": ...}
 _pending_edits: Dict[int, Dict[str, str]] = {}
+
+# Tracks pending view requests: chat_id -> {"alias": ..., "timestamp": ...}
+_pending_views: Dict[int, Dict[str, any]] = {}
+
+# Auto-delete timeout for sensitive messages (seconds)
+VIEW_MESSAGE_AUTODELET_SECONDS = 60
 
 # CSV field mappings for inline keyboard callbacks
 FIELD_MAPPINGS: Dict[str, tuple[str, str]] = {
@@ -180,6 +191,36 @@ def _validate_csv_permissions(csv_path: str) -> None:
         validate_file_permissions(csv_path, strict=False)
     except PermissionError as e:
         logger.warning("Credentials file has insecure permissions: %s", e)
+
+
+async def _auto_delete_message(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    message_id: int,
+    delay_seconds: int,
+) -> None:
+    """
+    Auto-delete a message after specified delay for security.
+    
+    Industry-standard practice for sensitive information display.
+    
+    Args:
+        context: Telegram context
+        chat_id: Chat ID where message was sent
+        message_id: Message ID to delete
+        delay_seconds: Delay before deletion
+    """
+    try:
+        await asyncio.sleep(delay_seconds)
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        logger.debug(
+            "Auto-deleted sensitive message: chat_id=%d, message_id=%d",
+            chat_id,
+            message_id
+        )
+    except Exception as e:
+        # Message may already be deleted by user or bot
+        logger.debug("Failed to auto-delete message: %s", e)
 
 
 # ============================================================
@@ -675,6 +716,328 @@ async def add_alias(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 @telegram_handler_error_wrapper
+async def view_credential(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Securely view credential details with confirmation and auto-deletion.
+    
+    Usage: /view <alias>
+    
+    Security Features:
+    - Requires explicit confirmation before revealing sensitive data
+    - Auto-deletes sensitive messages after 60 seconds
+    - Uses Telegram spoiler tags for password masking
+    - Comprehensive audit logging
+    - Never logs passwords
+    
+    Industry Standard Implementation:
+    - Two-step verification (command + confirmation)
+    - Time-limited exposure of credentials
+    - Audit trail for compliance
+    """
+    if not update.message:
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "<b>View Credentials</b>\n\n"
+            "<b>Usage:</b> <code>/view &lt;alias&gt;</code>\n\n"
+            "<b>Example:</b> <code>/view mybank_tmb</code>\n\n"
+            "⚠️ <b>Security Notice:</b>\n"
+            "• Displays sensitive credential information\n"
+            "• Requires confirmation before viewing\n"
+            "• Messages auto-delete after 60 seconds\n"
+            "• All views are audit logged",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    alias = context.args[0].strip()
+    app = context.application
+    creds = _get_credentials(app)
+
+    if alias not in creds:
+        await update.message.reply_text(
+            f"❌ Unknown alias <code>{html.escape(alias)}</code>.\n\n"
+            f"Use <code>/list</code> to see all configured accounts.",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    # Get credential details
+    cred = creds[alias]
+    bank = cred.get("bank_label", "UNKNOWN")
+    account_masked = _mask_account_number(str(cred.get("account_number", "")))
+
+    # Store pending view request
+    chat = update.effective_chat
+    if chat is None:
+        return
+
+    _pending_views[chat.id] = {
+        "alias": alias,
+        "timestamp": asyncio.get_event_loop().time(),
+    }
+
+    # Build confirmation keyboard
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "✅ Yes, Show Credentials",
+                callback_data=f"view_confirm|{alias}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "❌ Cancel",
+                callback_data=f"view_cancel|{alias}"
+            )
+        ],
+    ])
+
+    confirmation_msg = await update.message.reply_text(
+        f"🔒 <b>Credential View Confirmation</b>\n\n"
+        f"<b>Alias:</b> <code>{html.escape(alias)}</code>\n"
+        f"<b>Bank:</b> {html.escape(bank)}\n"
+        f"<b>Account:</b> <code>{html.escape(account_masked)}</code>\n\n"
+        f"⚠️ <b>Security Warning:</b>\n"
+        f"• This will display <b>sensitive information</b>\n"
+        f"• Message will auto-delete in {VIEW_MESSAGE_AUTODELET_SECONDS} seconds\n"
+        f"• This action will be <b>audit logged</b>\n\n"
+        f"Do you want to proceed?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+    # Auto-delete confirmation message after timeout
+    asyncio.create_task(
+        _auto_delete_message(
+            context,
+            chat.id,
+            confirmation_msg.message_id,
+            VIEW_MESSAGE_AUTODELET_SECONDS,
+        )
+    )
+
+    logger.debug(
+        "View credential request initiated: alias=%s, user_id=%s",
+        alias,
+        update.effective_user.id if update.effective_user else "unknown"
+    )
+
+
+async def view_confirm_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """
+    Handle credential view confirmation.
+    
+    Displays full credential details with:
+    - All authentication fields
+    - Spoiler-tagged password
+    - Auto-deletion after timeout
+    - Audit logging
+    """
+    query = update.callback_query
+    if query is None:
+        return
+
+    await query.answer()
+
+    try:
+        data = query.data or ""
+        _, alias = data.split("|")
+    except Exception:
+        logger.exception(
+            "Invalid callback data for view confirmation: %r",
+            getattr(query, "data", None)
+        )
+        if query.message:
+            await query.message.edit_text(
+                "❌ Invalid request. Please try <code>/view</code> again.",
+                parse_mode=ParseMode.HTML
+            )
+        return
+
+    chat = update.effective_chat
+    if chat is None:
+        return
+
+    # Verify pending view request
+    view_state = _pending_views.get(chat.id)
+    if not view_state or view_state.get("alias") != alias:
+        if query.message:
+            await query.message.edit_text(
+                "❌ View request expired or invalid. Please use <code>/view</code> again.",
+                parse_mode=ParseMode.HTML
+            )
+        return
+
+    # Clear pending view
+    _pending_views.pop(chat.id, None)
+
+    app = context.application
+    creds = _get_credentials(app)
+    
+    if alias not in creds:
+        if query.message:
+            await query.message.edit_text(
+                f"❌ Credential <code>{html.escape(alias)}</code> not found.",
+                parse_mode=ParseMode.HTML
+            )
+        return
+
+    # Get full credential details
+    cred = creds[alias]
+    bank = cred.get("bank_label", "UNKNOWN")
+    login_id = cred.get("login_id", "")
+    user_id = cred.get("user_id", "")
+    username = cred.get("username", "")
+    auth_id = cred.get("auth_id", "")
+    password = cred.get("password", "")
+    account_number = str(cred.get("account_number", ""))
+
+    # Build credential display
+    lines = [
+        "🔐 <b>Credential Details</b>",
+        "━━━━━━━━━━━━━━━━━━",
+        "",
+        f"<b>Alias:</b> <code>{html.escape(alias)}</code>",
+        f"<b>Bank:</b> {html.escape(bank)}",
+        "",
+    ]
+
+    # Add authentication fields
+    if login_id:
+        lines.append(f"<b>Login ID:</b> <code>{html.escape(login_id)}</code>")
+    if user_id:
+        lines.append(f"<b>User ID:</b> <code>{html.escape(user_id)}</code>")
+    if username:
+        lines.append(f"<b>Username:</b> <code>{html.escape(username)}</code>")
+    if auth_id and not (login_id or user_id or username):
+        lines.append(f"<b>Auth ID:</b> <code>{html.escape(auth_id)}</code>")
+
+    # Add password with spoiler tag (Telegram feature)
+    if password:
+        lines.append(f"<b>Password:</b> <span class=\"tg-spoiler\">{html.escape(password)}</span>")
+    
+    # Add account number
+    lines.append(f"<b>Account Number:</b> <code>{html.escape(account_number)}</code>")
+
+    # Add security notice
+    lines.extend([
+        "",
+        "━━━━━━━━━━━━━━━━━━",
+        f"⏱ <i>This message will auto-delete in {VIEW_MESSAGE_AUTODELET_SECONDS} seconds</i>",
+        f"🔒 <i>Tap password to reveal</i>",
+    ])
+
+    credential_text = "\n".join(lines)
+
+    # Delete confirmation message and send credential details
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+
+    # Send credential message
+    credential_msg = await context.bot.send_message(
+        chat_id=chat.id,
+        text=credential_text,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+    # Auto-delete credential message after timeout
+    asyncio.create_task(
+        _auto_delete_message(
+            context,
+            chat.id,
+            credential_msg.message_id,
+            VIEW_MESSAGE_AUTODELET_SECONDS,
+        )
+    )
+
+    # Audit log (without password)
+    log_audit_event(
+        "CREDENTIAL_VIEWED",
+        {
+            "alias": alias,
+            "bank": bank,
+            "user_id": update.effective_user.id if update.effective_user else "unknown",
+            "auto_delete_seconds": VIEW_MESSAGE_AUTODELET_SECONDS,
+        },
+        level=logging.WARNING,  # High sensitivity - WARNING level
+    )
+
+    logger.warning(
+        "Credential viewed: alias=%s, user_id=%s, auto_delete=%ds",
+        alias,
+        update.effective_user.id if update.effective_user else "unknown",
+        VIEW_MESSAGE_AUTODELET_SECONDS
+    )
+
+
+async def view_cancel_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """
+    Handle credential view cancellation.
+    
+    Cleans up pending view request and confirms cancellation.
+    """
+    query = update.callback_query
+    if query is None:
+        return
+
+    await query.answer("View cancelled")
+
+    try:
+        data = query.data or ""
+        _, alias = data.split("|")
+    except Exception:
+        logger.exception(
+            "Invalid callback data for view cancel: %r",
+            getattr(query, "data", None)
+        )
+        return
+
+    chat = update.effective_chat
+    if chat is None:
+        return
+
+    # Clear pending view
+    _pending_views.pop(chat.id, None)
+
+    # Update message
+    if query.message:
+        try:
+            await query.message.edit_text(
+                f"✅ View request cancelled for <code>{html.escape(alias)}</code>.",
+                parse_mode=ParseMode.HTML
+            )
+            
+            # Auto-delete cancellation message
+            asyncio.create_task(
+                _auto_delete_message(
+                    context,
+                    chat.id,
+                    query.message.message_id,
+                    10,  # Delete cancellation message after 10 seconds
+                )
+            )
+        except Exception:
+            pass
+
+    logger.debug(
+        "View credential request cancelled: alias=%s, user_id=%s",
+        alias,
+        update.effective_user.id if update.effective_user else "unknown"
+    )
+
+
+@telegram_handler_error_wrapper
 async def edit_alias(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Start interactive credential editing flow.
@@ -908,6 +1271,7 @@ def register_alias_handlers(
     Registered commands:
         /list, /aliases - Display all configured credentials
         /add            - Create new credential entry
+        /view           - Securely view credential details (with auto-deletion)
         /edit           - Interactive credential editor
     
     Args:
@@ -917,7 +1281,12 @@ def register_alias_handlers(
     # Command handlers
     app.add_handler(CommandHandler(["list", "aliases"], list_aliases))
     app.add_handler(CommandHandler("add", add_alias))
+    app.add_handler(CommandHandler("view", view_credential))
     app.add_handler(CommandHandler("edit", edit_alias))
+    
+    # Callback handlers for view confirmations
+    app.add_handler(CallbackQueryHandler(view_confirm_callback, pattern=r"^view_confirm\|"))
+    app.add_handler(CallbackQueryHandler(view_cancel_callback, pattern=r"^view_cancel\|"))
     
     # Callback handler for edit button clicks
     app.add_handler(CallbackQueryHandler(edit_button_callback, pattern=r"^edit\|"))
@@ -931,4 +1300,4 @@ def register_alias_handlers(
     )
     app.add_handler(edit_text_handler, group=-100)
     
-    logger.info("Alias management handlers registered")
+    logger.info("Alias management handlers registered (including secure /view)")
