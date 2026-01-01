@@ -1,13 +1,18 @@
 # payatom_bot/workers/iob.py
 """
-Indian Overseas Bank (Retail + Corporate) worker with robust error handling.
+Indian Overseas Bank (Retail + Corporate) automation worker.
 
-Features:
-- Automatic error recovery with retries
-- Professional error messages with screenshots
-- Safe operations for non-critical tasks
-- Comprehensive logging
-- Context-aware error reporting
+Supports both retail and corporate banking interfaces with:
+- Automatic CAPTCHA solving with 2Captcha integration
+- Session management with logged-out detection
+- Robust error recovery with retries and screenshots
+- CipherBank statement upload integration
+- Balance monitoring with alerts
+
+Architecture:
+- Inherits from BaseWorker for common Selenium/Telegram functionality
+- Uses ErrorContext for comprehensive error handling
+- Thread-safe operations for concurrent worker management
 """
 from __future__ import annotations
 
@@ -18,7 +23,7 @@ import logging
 from io import BytesIO
 from datetime import datetime, timedelta
 from typing import Optional
-from telegram.constants import ParseMode
+
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
@@ -27,36 +32,46 @@ from selenium.common.exceptions import TimeoutException, ElementClickIntercepted
 from ..cipherbank_client import get_cipherbank_client 
 from ..worker_base import BaseWorker
 from ..captcha_solver import TwoCaptcha
-from ..autobank_client import AutoBankClient
-from ..error_handler import (
-    worker_method_error_wrapper,
-    ErrorContext,
-    safe_operation,
-)
+from ..error_handler import ErrorContext, safe_operation
 
 logger = logging.getLogger(__name__)
 
 
 class IOBWorker(BaseWorker):
     """
-    Indian Overseas Bank (Retail + Corporate).
-
-    Decides 'personal' vs 'corporate' by alias suffix or bank_label from creds.
-
-    CSV schema used:
-        alias,login_id,user_id,username,password,account_number
-
-    cred fields available (via creds loader):
-        cred["auth_id"]         # canonical user (username/login_id/user_id)
-        cred["username"]        # raw
-        cred["login_id"]        # raw (corp)
-        cred["user_id"]         # raw (corp)
-        cred["password"]
-        cred["account_number"]
-        cred["bank_label"]      # "IOB" OR "IOB CORPORATE" (derived from alias)
+    Indian Overseas Bank (Retail + Corporate) automation worker.
+    
+    Determines retail vs corporate mode based on alias suffix (_iobcorp) or
+    bank_label in credentials. Handles different login flows accordingly.
+    
+    Expected credentials (from CSV loader):
+        alias: str - Account identifier
+        auth_id: str - Canonical user ID (username/login_id/user_id)
+        username: str - Raw username field (retail)
+        login_id: str - Corporate login ID (corporate)
+        user_id: str - Corporate user ID (corporate)
+        password: str - Account password
+        account_number: str - Bank account number
+        bank_label: str - "IOB" or "IOB CORPORATE"
     """
 
+    # Class constants
     LOGIN_URL = "https://netbanking.iob.bank.in/ibanking/html/index.html"
+    
+    # Timeout values (seconds)
+    TIMEOUT_STANDARD = 20
+    TIMEOUT_LONG = 60
+    TIMEOUT_EXTRA_LONG = 180
+    TIMEOUT_CAPTCHA_WAIT = 10
+    TIMEOUT_ERROR_DETECTION = 5
+    
+    # Retry configuration
+    MAX_OUTER_RETRIES = 5
+    CYCLE_SLEEP_SECONDS = 60
+    
+    # CAPTCHA configuration
+    CAPTCHA_MIN_LENGTH = 6
+    CAPTCHA_MAX_LENGTH = 6
 
     def __init__(
         self,
@@ -69,6 +84,18 @@ class IOBWorker(BaseWorker):
         profile_dir: str,
         two_captcha: Optional[TwoCaptcha] = None,
     ):
+        """
+        Initialize IOB worker.
+        
+        Args:
+            bot: Telegram bot instance
+            chat_id: Telegram chat ID for notifications
+            alias: Worker alias (account identifier)
+            cred: Credential dictionary from CSV loader
+            messenger: Messenger instance for notifications
+            profile_dir: Chrome profile directory path
+            two_captcha: Optional 2Captcha solver instance
+        """
         super().__init__(
             bot=bot,
             chat_id=chat_id,
@@ -77,21 +104,126 @@ class IOBWorker(BaseWorker):
             messenger=messenger,
             profile_dir=profile_dir,
         )
-        self.wait = WebDriverWait(self.driver, 20)
+        self.wait = WebDriverWait(self.driver, self.TIMEOUT_STANDARD)
         self.solver = two_captcha
         self.iob_win: Optional[str] = None
         self._captcha_id: Optional[str] = None
         self.captcha_code: Optional[str] = None
 
-    # ------------------------------------------------------------------
-    # Robust tab-cycling with error handling (PRESERVED BUT NOT USED)
-    # ------------------------------------------------------------------
+    # ============================================================
+    # Main Worker Loop
+    # ============================================================
+
+    def run(self) -> None:
+        """
+        Main worker loop with robust error handling.
+        
+        Continuously:
+        1. Login to IOB (with retry on failure)
+        2. Download and upload statements (60s cycle)
+        3. Update account balance
+        4. Handle session timeouts and errors
+        
+        Stops after MAX_OUTER_RETRIES consecutive failures.
+        """
+        self.info("Starting IOB automation")
+        retry_count = 0
+        
+        try:
+            while not self.stop_evt.is_set():
+                try:
+                    # Fresh login for each outer loop
+                    self._login()
+                    retry_count = 0  # Reset on successful login
+
+                    # Steady-state loop
+                    while not self.stop_evt.is_set():
+                        # Check for server-side logout
+                        self._check_logged_out_and_cycle()
+
+                        # Download and upload statement
+                        self._download_and_upload_statement()
+
+                        # Check again before balance enquiry
+                        self._check_logged_out_and_cycle()
+
+                        # Balance enquiry (best-effort)
+                        balance_result = safe_operation(
+                            self._balance_enquiry,
+                            context=f"balance enquiry for {self.alias}",
+                            default=None
+                        )
+                        
+                        if balance_result is None:
+                            logger.debug("[%s] Balance enquiry skipped", self.alias)
+
+                        time.sleep(self.CYCLE_SLEEP_SECONDS)
+                        
+                except TimeoutException as e:
+                    retry_count += 1
+                    logger.warning(
+                        "[%s] Timeout/logged-out (retry %d/%d): %s",
+                        self.alias,
+                        retry_count,
+                        self.MAX_OUTER_RETRIES,
+                        e
+                    )
+                    
+                    if retry_count > self.MAX_OUTER_RETRIES:
+                        self.error(
+                            f"Too many failures ({self.MAX_OUTER_RETRIES}). "
+                            f"Stopping IOB worker."
+                        )
+                        return
+                    
+                    # Screenshot and reset
+                    try:
+                        self.screenshot_all_tabs(
+                            f"IOB error - retry {retry_count}/{self.MAX_OUTER_RETRIES}"
+                        )
+                    except Exception:
+                        pass
+                    
+                    self._cycle_tabs()
+                    
+                except Exception as e:
+                    retry_count += 1
+                    self.error(
+                        f"Loop error (retry {retry_count}/{self.MAX_OUTER_RETRIES}): "
+                        f"{type(e).__name__}: {e}"
+                    )
+                    
+                    try:
+                        self.screenshot_all_tabs("IOB error")
+                    except Exception:
+                        pass
+
+                    if retry_count > self.MAX_OUTER_RETRIES:
+                        self.error(
+                            f"Too many failures ({self.MAX_OUTER_RETRIES}). "
+                            f"Stopping IOB worker."
+                        )
+                        return
+
+                    self._cycle_tabs()
+                    
+        finally:
+            self.stop()
+
+    # ============================================================
+    # Session Management
+    # ============================================================
+
     def _cycle_tabs(self) -> None:
         """
-        Close all existing tabs, open a fresh about:blank tab and reset
-        login state with robust error handling.
+        Reset browser session by cycling tabs.
         
-        NOTE: Currently not used as AutoBank uploads are disabled.
+        Closes all existing tabs, opens a fresh about:blank tab,
+        and resets login state. Used for recovery from errors
+        or session timeouts.
+        
+        This method is actively used for error recovery throughout
+        the worker lifecycle.
         """
         d = self.driver
         
@@ -108,10 +240,10 @@ class IOBWorker(BaseWorker):
             )
             
             if not handles_before:
-                logger.warning("IOB %s: no windows to cycle; driver may be closed", self.alias)
+                logger.warning("[%s] No windows to cycle; driver may be closed", self.alias)
                 return
 
-            # 1) Open a new blank tab
+            # Open new blank tab
             safe_operation(
                 lambda: d.execute_script("window.open('about:blank','_blank');"),
                 context=f"open new tab for {self.alias}",
@@ -119,7 +251,7 @@ class IOBWorker(BaseWorker):
             )
             time.sleep(0.5)
 
-            # 2) Find the newly opened handle
+            # Find newly opened handle
             handles_after = safe_operation(
                 lambda: list(d.window_handles),
                 context=f"get new window handles for {self.alias}",
@@ -133,35 +265,38 @@ class IOBWorker(BaseWorker):
                     break
 
             if not new_handle:
-                logger.error("IOB %s: failed to locate new tab during cycle", self.alias)
+                logger.error("[%s] Failed to locate new tab during cycle", self.alias)
                 return
 
-            # 3) Close every old tab
+            # Close all old tabs
             for h in handles_before:
                 try:
                     d.switch_to.window(h)
                     d.close()
                 except Exception as e:
-                    logger.debug("IOB %s: failed to close old tab: %s", self.alias, e)
+                    logger.debug("[%s] Failed to close old tab: %s", self.alias, e)
 
-            # 4) Switch into the fresh tab and reset state
+            # Switch to fresh tab and reset state
             try:
                 d.switch_to.window(new_handle)
                 self.iob_win = new_handle
                 self.captcha_code = None
                 self.logged_in = False
-                self.info("🔄 IOB: cycled tabs – will re-login on next loop")
+                self.info("Browser tabs cycled - will re-login on next loop")
             except Exception as e:
-                logger.error("IOB %s: failed to switch to new tab: %s", self.alias, e)
+                logger.error("[%s] Failed to switch to new tab: %s", self.alias, e)
                 self.stop_evt.set()
 
-    # ------------------------------------------------------------------
-    # Detect "You are Logged OUT..." page with error handling
-    # ------------------------------------------------------------------
     def _check_logged_out_and_cycle(self) -> None:
         """
-        Check if the current page shows the IOB 'You are Logged OUT' message.
-        If detected, immediately cycle tabs and force a retry.
+        Detect server-side logout and force session reset.
+        
+        Checks for IOB's "You are Logged OUT" message in page source.
+        If detected, immediately cycles tabs and raises TimeoutException
+        to trigger retry logic.
+        
+        Raises:
+            TimeoutException: If logged-out message detected
         """
         source = safe_operation(
             lambda: self.driver.page_source,
@@ -169,194 +304,220 @@ class IOBWorker(BaseWorker):
             default=""
         )
         
-        if source and "You are Logged OUT of internet banking due to ANY of the following reasons" in source:
-            self.info("IOB: detected logged-out page; cycling tabs and retrying login")
+        if source and "You are Logged OUT of internet banking" in source:
+            self.info("Detected logged-out page; cycling tabs and retrying login")
             self._cycle_tabs()
             raise TimeoutException("IOB logged out (server message)")
 
-    # ———————————————————
-    # Public thread entry with robust error handling
-    # ———————————————————
-    def run(self) -> None:
-        """Main worker loop with comprehensive error handling."""
-        self.info("🚀 Starting IOB automation")
-        retry_count = 0
-        max_retries = 5
-        
-        try:
-            while not self.stop_evt.is_set():
-                try:
-                    # Fresh login for each outer loop
-                    self._login()
-                    retry_count = 0  # reset after successful login
+    # ============================================================
+    # Login Flow
+    # ============================================================
 
-                    # Steady-state: download → upload → balance → sleep
-                    while not self.stop_evt.is_set():
-                        # Check if server has logged us out
-                        self._check_logged_out_and_cycle()
-
-                        # 1) Download + upload statement (with internal retries)
-                        self._download_and_upload_statement()
-
-                        # Check again before balance enquiry
-                        self._check_logged_out_and_cycle()
-
-                        # 2) Balance enquiry (best-effort; don't crash on failure)
-                        balance_result = safe_operation(
-                            self._balance_enquiry,
-                            context=f"balance enquiry for {self.alias}",
-                            default=None
-                        )
-                        
-                        if balance_result is None:
-                            self.info("ℹ️ Balance enquiry skipped (selector/layout change)")
-
-                        time.sleep(60)  # steady-state sleep
-                        
-                except TimeoutException as e:
-                    # Logged-out or timeout - increment retry and continue
-                    retry_count += 1
-                    logger.warning(
-                        "IOB %s timeout/logged-out (retry %d/%d): %s",
-                        self.alias,
-                        retry_count,
-                        max_retries,
-                        e
-                    )
-                    
-                    if retry_count > max_retries:
-                        self.error(f"❌ Too many failures ({max_retries}). Stopping IOB worker.")
-                        return
-                    
-                    # Screenshot and reset
-                    try:
-                        self.screenshot_all_tabs(f"IOB error - retry {retry_count}/{max_retries}")
-                    except Exception:
-                        pass
-                    
-                    self._cycle_tabs()
-                    
-                except Exception as e:
-                    retry_count += 1
-                    self.error(
-                        f"⚠️ IOB loop error (retry {retry_count}/{max_retries}): "
-                        f"{type(e).__name__}: {e}"
-                    )
-                    
-                    try:
-                        self.screenshot_all_tabs("IOB error")
-                    except Exception:
-                        pass
-
-                    if retry_count > max_retries:
-                        self.error(f"❌ Too many failures ({max_retries}). Stopping IOB worker.")
-                        return
-
-                    self._cycle_tabs()
-                    
-        finally:
-            self.stop()
-
-    # ———————————————————
-    # Steps with error handling
-    # ———————————————————
-    @worker_method_error_wrapper
     def _login(self) -> None:
-        """Login to IOB with automatic error handling and screenshots."""
+        """
+        Login to IOB with CAPTCHA solving.
+        
+        Flow:
+        1. Navigate to login page
+        2. Click "Continue to Internet Banking"
+        3. Select Personal/Corporate login mode
+        4. Fill credentials (retail or corporate)
+        5. Solve CAPTCHA (automatic or manual via Telegram)
+        6. Submit and wait for dashboard
+        
+        Raises:
+            RuntimeError: If login fails
+            TimeoutException: If page elements not found
+        """
         d = self.driver
         w = self.wait
 
-        with ErrorContext("opening IOB login page", messenger=self.msgr, alias=self.alias):
-            # 1) Open login page
+        # Determine login mode
+        is_corp = self._is_corporate_mode()
+        role_text = "Corporate Login" if is_corp else "Personal Login"
+
+        with ErrorContext("IOB login", messenger=self.msgr, alias=self.alias):
+            # Navigate to login page
             d.get(self.LOGIN_URL)
 
-        with ErrorContext("clicking continue to internet banking", messenger=self.msgr, alias=self.alias):
-            # 2) Click "Continue to Internet Banking Home Page"
+            # Click continue to internet banking
             w.until(
-                EC.element_to_be_clickable((By.LINK_TEXT, "Continue to Internet Banking Home Page"))
+                EC.element_to_be_clickable(
+                    (By.LINK_TEXT, "Continue to Internet Banking Home Page")
+                )
             ).click()
 
-        # 3) Choose personal vs corporate
-        is_corp = False
-        bank_label = (self.cred.get("bank_label") or "").upper().strip()
-        if bank_label == "IOB CORPORATE" or self.alias.lower().endswith("_iobcorp"):
-            is_corp = True
-        role_text = "Corporate Login" if is_corp else "Personal Login"
-        
-        with ErrorContext(f"selecting {role_text}", messenger=self.msgr, alias=self.alias):
+            # Select login mode
             w.until(EC.element_to_be_clickable((By.LINK_TEXT, role_text))).click()
 
-        # 4) Fill credentials
-        with ErrorContext("filling login credentials", messenger=self.msgr, alias=self.alias):
-            if is_corp:
-                # Corporate uses separate loginId + userId + password
-                d.find_element(By.NAME, "loginId").send_keys(self.cred.get("login_id", ""))
-                d.find_element(By.NAME, "userId").send_keys(self.cred.get("user_id", ""))
-                d.find_element(By.NAME, "password").send_keys(self.cred["password"])
+            # Fill credentials
+            self._fill_login_credentials(is_corp)
+
+            # Solve and submit CAPTCHA
+            self._solve_and_submit_captcha()
+
+            # Wait for successful login
+            w.until(EC.presence_of_element_located((By.CSS_SELECTOR, "nav.accordian")))
+            self.iob_win = d.current_window_handle
+            self.logged_in = True
+            self.info("Logged in to IOB successfully")
+
+    def _is_corporate_mode(self) -> bool:
+        """
+        Determine if this is a corporate account.
+        
+        Returns:
+            True if corporate mode, False for retail mode
+        """
+        bank_label = (self.cred.get("bank_label") or "").upper().strip()
+        return (
+            bank_label == "IOB CORPORATE" or 
+            self.alias.lower().endswith("_iobcorp")
+        )
+
+    def _fill_login_credentials(self, is_corporate: bool) -> None:
+        """
+        Fill login credentials based on account type.
+        
+        Args:
+            is_corporate: True for corporate login, False for retail
+        """
+        d = self.driver
+        
+        with ErrorContext(
+            "filling login credentials",
+            messenger=self.msgr,
+            alias=self.alias
+        ):
+            if is_corporate:
+                # Corporate: separate loginId + userId + password
+                d.find_element(By.NAME, "loginId").send_keys(
+                    self.cred.get("login_id", "")
+                )
+                d.find_element(By.NAME, "userId").send_keys(
+                    self.cred.get("user_id", "")
+                )
+                d.find_element(By.NAME, "password").send_keys(
+                    self.cred["password"]
+                )
             else:
-                # Retail takes loginId + password
+                # Retail: loginId + password
                 user = self.cred.get("auth_id") or self.cred.get("username") or ""
                 d.find_element(By.NAME, "loginId").send_keys(user)
                 d.find_element(By.NAME, "password").send_keys(self.cred["password"])
 
-        # 5) Captcha image
-        with ErrorContext("capturing CAPTCHA image", messenger=self.msgr, alias=self.alias):
-            img = WebDriverWait(d, 10).until(
+    def _solve_and_submit_captcha(self) -> None:
+        """
+        Solve CAPTCHA and submit login form.
+        
+        Attempts automatic solving via 2Captcha. Falls back to manual
+        solving via Telegram if automatic fails.
+        
+        Raises:
+            TimeoutException: If CAPTCHA solving fails or is incorrect
+        """
+        d = self.driver
+        
+        with ErrorContext("solving CAPTCHA", messenger=self.msgr, alias=self.alias):
+            # Capture CAPTCHA image
+            img = WebDriverWait(d, self.TIMEOUT_CAPTCHA_WAIT).until(
                 EC.presence_of_element_located((By.ID, "captchaimg"))
             )
+            
             # Scroll into view
             d.execute_script("arguments[0].scrollIntoView(true);", img)
             time.sleep(1)
 
             # Re-locate after scroll
-            img = WebDriverWait(d, 10).until(
+            img = WebDriverWait(d, self.TIMEOUT_CAPTCHA_WAIT).until(
                 EC.visibility_of_element_located((By.ID, "captchaimg"))
             )
             img_bytes = img.screenshot_as_png
 
-        # 6) Solve captcha
-        with ErrorContext("solving CAPTCHA", messenger=self.msgr, alias=self.alias):
-            self.info("🤖 Solving CAPTCHA via 2Captcha…")
-            solution, cid = (None, None)
-            if self.solver and safe_operation(lambda: self.solver.key, context="get 2Captcha key", default=None):
-                solution, cid = safe_operation(
-                    lambda: self.solver.solve(img_bytes, min_len=6, max_len=6, regsense=True),
-                    context="2Captcha solve",
-                    default=(None, None)
-                )
-
-            if solution:
-                normalized = re.sub(r"\s+", "", solution).upper()
-                self.captcha_code, self._captcha_id = normalized, cid
-                self.info(f"✅ Auto-solved: `{normalized}`")
-            else:
+            # Attempt automatic solving
+            solution = self._solve_captcha_automatic(img_bytes)
+            
+            if not solution:
+                # Fallback to manual solving via Telegram
                 self.msgr.send_photo(
                     BytesIO(img_bytes),
-                    f"[{self.alias}] 🔐 Please solve captcha",
+                    f"[{self.alias}] Please solve CAPTCHA for IOB login",
                     kind="CAPTCHA",
                 )
-                raise TimeoutException("CAPTCHA not solved – add your manual flow if needed.")
+                raise TimeoutException(
+                    "CAPTCHA not solved automatically - manual entry required"
+                )
 
-        # 7) Fill the captcha
-        with ErrorContext("entering CAPTCHA solution", messenger=self.msgr, alias=self.alias):
+            # Fill CAPTCHA
             field = d.find_element(By.NAME, "captchaid")
             field.clear()
-            field.send_keys((self.captcha_code or "").strip().upper())
+            field.send_keys(solution.strip().upper())
 
-        # 8) Submit
-        with ErrorContext("submitting login form", messenger=self.msgr, alias=self.alias):
+            # Submit form
             d.find_element(By.ID, "btnSubmit").click()
 
-        # 8a) Check for wrong captcha
-        try:
-            err_span = WebDriverWait(d, 5).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "div.otpmsg span.red"))
+            # Check for incorrect CAPTCHA error
+            self._check_captcha_error()
+
+    def _solve_captcha_automatic(self, img_bytes: bytes) -> Optional[str]:
+        """
+        Attempt automatic CAPTCHA solving via 2Captcha.
+        
+        Args:
+            img_bytes: CAPTCHA image bytes
+            
+        Returns:
+            Normalized CAPTCHA solution or None if solving failed
+        """
+        self.info("Attempting automatic CAPTCHA solve via 2Captcha")
+        
+        solution, cid = (None, None)
+        if self.solver and safe_operation(
+            lambda: self.solver.key, 
+            context="get 2Captcha key", 
+            default=None
+        ):
+            solution, cid = safe_operation(
+                lambda: self.solver.solve(
+                    img_bytes,
+                    min_len=self.CAPTCHA_MIN_LENGTH,
+                    max_len=self.CAPTCHA_MAX_LENGTH,
+                    regsense=True
+                ),
+                context="2Captcha solve",
+                default=(None, None)
             )
+
+        if solution:
+            # Normalize: remove whitespace and uppercase
+            normalized = re.sub(r"\s+", "", solution).upper()
+            self.captcha_code, self._captcha_id = normalized, cid
+            self.info(f"CAPTCHA solved automatically: {normalized}")
+            return normalized
+        
+        return None
+
+    def _check_captcha_error(self) -> None:
+        """
+        Check for incorrect CAPTCHA error message.
+        
+        Raises:
+            TimeoutException: If CAPTCHA was incorrect
+        """
+        d = self.driver
+        
+        try:
+            err_span = WebDriverWait(d, self.TIMEOUT_ERROR_DETECTION).until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, "div.otpmsg span.red")
+                )
+            )
+            
             if (
                 "captcha entered is incorrect" in (err_span.text or "").lower()
                 and self._captcha_id
             ):
-                self.error("❌ CAPTCHA wrong — reporting to 2Captcha and retrying…")
+                self.error("CAPTCHA incorrect - reporting to 2Captcha and retrying")
                 if self.solver:
                     safe_operation(
                         lambda: self.solver.report_bad(self._captcha_id),
@@ -364,243 +525,329 @@ class IOBWorker(BaseWorker):
                         default=None
                     )
                 self._cycle_tabs()
-                raise TimeoutException("Captcha incorrect")
+                raise TimeoutException("CAPTCHA incorrect")
+                
         except TimeoutException:
-            # no error shown → carry on to dashboard
+            # No error shown - login successful
             pass
 
-        # 9) Wait for main nav (logged in)
-        with ErrorContext("waiting for login confirmation", messenger=self.msgr, alias=self.alias):
-            w.until(EC.presence_of_element_located((By.CSS_SELECTOR, "nav.accordian")))
-            self.iob_win = d.current_window_handle
-            self.logged_in = True
-            self.info("✅ Logged in to IOB!")
+    # ============================================================
+    # Statement Download and Upload
+    # ============================================================
 
-    @worker_method_error_wrapper
     def _download_and_upload_statement(self) -> None:
-        """Download statement and upload to CipherBank with error handling."""
+        """
+        Download statement and upload to CipherBank.
+        
+        Flow:
+        1. Navigate to Account Statement page
+        2. Select target account
+        3. Set date range (previous day or today based on time)
+        4. View and export statement as CSV
+        5. Upload to CipherBank with retries
+        
+        Uses CipherBank for statement processing. AutoBank upload
+        is deprecated and has been removed.
+        """
         d = self.driver
 
-        # 1) Navigate to "Account statement"
-        with ErrorContext("navigating to Account Statement", messenger=self.msgr, alias=self.alias):
-            stmt_link = WebDriverWait(d, 60).until(
-                EC.element_to_be_clickable((By.LINK_TEXT, "Account statement"))
-            )
-            d.execute_script("arguments[0].scrollIntoView({block:'center'});", stmt_link)
-            time.sleep(0.3)
-            try:
-                stmt_link.click()
-            except ElementClickInterceptedException:
-                d.execute_script("arguments[0].click();", stmt_link)
-            time.sleep(3)
+        with ErrorContext(
+            "downloading and uploading statement",
+            messenger=self.msgr,
+            alias=self.alias
+        ):
+            # Navigate to Account Statement
+            self._navigate_to_account_statement()
 
-        # 2) Pick the right account
-        with ErrorContext("selecting account", messenger=self.msgr, alias=self.alias):
-            acct_sel = self.wait.until(EC.element_to_be_clickable((By.ID, "accountNo")))
-            dropdown = Select(acct_sel)
-            acct_no = (self.cred.get("account_number") or "").strip()
-            if acct_no:
-                for opt in dropdown.options:
-                    if opt.text.strip().startswith(acct_no):
-                        dropdown.select_by_visible_text(opt.text)
-                        break
+            # Select account
+            self._select_account()
 
-        # 3) Compute date window
+            # Set date range
+            from_str, to_str = self._calculate_date_range()
+            self._set_date_range(from_str, to_str)
+
+            # View transactions
+            self._click_view_statement()
+
+            # Export CSV
+            csv_path = self._export_statement_csv()
+
+            # Upload to CipherBank
+            self._upload_to_cipherbank(csv_path)
+
+    def _navigate_to_account_statement(self) -> None:
+        """Navigate to Account Statement page."""
+        d = self.driver
+        
+        stmt_link = WebDriverWait(d, self.TIMEOUT_LONG).until(
+            EC.element_to_be_clickable((By.LINK_TEXT, "Account statement"))
+        )
+        self._safe_click(stmt_link)
+        time.sleep(3)
+
+    def _select_account(self) -> None:
+        """Select target account from dropdown."""
+        acct_sel = self.wait.until(
+            EC.element_to_be_clickable((By.ID, "accountNo"))
+        )
+        dropdown = Select(acct_sel)
+        acct_no = (self.cred.get("account_number") or "").strip()
+        
+        if acct_no:
+            for opt in dropdown.options:
+                if opt.text.strip().startswith(acct_no):
+                    dropdown.select_by_visible_text(opt.text)
+                    break
+
+    def _calculate_date_range(self) -> tuple[str, str]:
+        """
+        Calculate statement date range based on current time.
+        
+        Uses 6 AM cutover:
+        - Before 6 AM: from=yesterday, to=today
+        - After 6 AM: from=today, to=today
+        
+        Returns:
+            Tuple of (from_date, to_date) in MM/DD/YYYY format
+        """
         now = datetime.now()
         from_dt = now - timedelta(days=1) if now.hour < 6 else now
         to_dt = now
+        
         from_str = from_dt.strftime("%m/%d/%Y")
         to_str = to_dt.strftime("%m/%d/%Y")
-
-        # 4) Fill "From Date"
-        with ErrorContext("setting from date", messenger=self.msgr, alias=self.alias):
-            from_input = self.wait.until(EC.presence_of_element_located((By.ID, "fromDate")))
-            d.execute_script("arguments[0].removeAttribute('readonly')", from_input)
-            d.execute_script("arguments[0].value = arguments[1]", from_input, from_str)
-
-        # 5) Fill "To Date"
-        with ErrorContext("setting to date", messenger=self.msgr, alias=self.alias):
-            to_input = self.wait.until(EC.presence_of_element_located((By.ID, "toDate")))
-            d.execute_script("arguments[0].removeAttribute('readonly')", to_input)
-            d.execute_script("arguments[0].value = arguments[1]", to_input, to_str)
-
-        # 6) Click "View"
-        with ErrorContext("clicking View button", messenger=self.msgr, alias=self.alias):
-            view_btn = self.wait.until(
-                EC.element_to_be_clickable((By.ID, "accountstatement_view"))
-            )
-            d.execute_script("arguments[0].scrollIntoView({block:'center'});", view_btn)
-            time.sleep(0.3)
-            try:
-                view_btn.click()
-            except ElementClickInterceptedException:
-                d.execute_script("arguments[0].click();", view_btn)
-
-        # 7) Export CSV
-        with ErrorContext("exporting CSV", messenger=self.msgr, alias=self.alias):
-            csv_btn = WebDriverWait(d, 20).until(
-                EC.element_to_be_clickable((By.ID, "accountstatement_csvAcctStmt"))
-            )
-            d.execute_script("arguments[0].scrollIntoView({block:'center'});", csv_btn)
-            time.sleep(0.3)
-            try:
-                csv_btn.click()
-            except ElementClickInterceptedException:
-                d.execute_script("arguments[0].click();", csv_btn)
-
-        # 8) Wait for CSV download
-        time.sleep(3)
-        with ErrorContext("waiting for CSV download", messenger=self.msgr, alias=self.alias):
-            csv_path = self.wait_newest_file(".csv", timeout=60.0)
-            if not csv_path:
-                raise TimeoutException("Timed out waiting for IOB CSV download")
-            self.info(f"📥 Downloaded CSV: {os.path.basename(csv_path)}")
         
-        time.sleep(5)
+        logger.debug(
+            "[%s] Date range: %s to %s",
+            self.alias,
+            from_str,
+            to_str
+        )
+        
+        return from_str, to_str
 
-        # ============================================================
-        # 9) Upload to AutoBank (DISABLED - COMMENTED OUT)
-        # ============================================================
-        # original_handle = d.current_window_handle
-        # 
-        # with ErrorContext("opening AutoBank upload tab", messenger=self.msgr, alias=self.alias):
-        #     d.execute_script("window.open('about:blank');")
-        #     autobank_handle = [h for h in d.window_handles if h != original_handle][-1]
-        # 
-        # max_attempts = 5
-        # for attempt in range(1, max_attempts + 1):
-        #     with ErrorContext(
-        #         f"uploading to AutoBank (attempt {attempt}/{max_attempts})",
-        #         messenger=self.msgr,
-        #         alias=self.alias,
-        #         reraise=(attempt == max_attempts)
-        #     ):
-        #         d.switch_to.window(autobank_handle)
-        #         AutoBankClient(d).upload("IOB", acct_no, csv_path)
-        #         self.info(f"✅ AutoBank upload succeeded (attempt {attempt}/{max_attempts})")
-        #         break
-        # 
-        # # Return to IOB tab
-        # with ErrorContext("closing upload tab", messenger=self.msgr, alias=self.alias, reraise=False):
-        #     d.switch_to.window(original_handle)
-        #     for h in list(d.window_handles):
-        #         if h != original_handle:
-        #             d.switch_to.window(h)
-        #             d.close()
-        #     d.switch_to.window(original_handle)
+    def _set_date_range(self, from_str: str, to_str: str) -> None:
+        """
+        Set from and to dates in statement form.
+        
+        Args:
+            from_str: From date in MM/DD/YYYY format
+            to_str: To date in MM/DD/YYYY format
+        """
+        d = self.driver
+        
+        # Set From Date
+        from_input = self.wait.until(
+            EC.presence_of_element_located((By.ID, "fromDate"))
+        )
+        d.execute_script("arguments[0].removeAttribute('readonly')", from_input)
+        d.execute_script("arguments[0].value = arguments[1]", from_input, from_str)
 
-        # ============================================================
-        # 10) Upload to CipherBank (ACTIVE)
-        # ============================================================
+        # Set To Date
+        to_input = self.wait.until(
+            EC.presence_of_element_located((By.ID, "toDate"))
+        )
+        d.execute_script("arguments[0].removeAttribute('readonly')", to_input)
+        d.execute_script("arguments[0].value = arguments[1]", to_input, to_str)
+
+    def _click_view_statement(self) -> None:
+        """Click View button to display statement."""
+        d = self.driver
+        
+        view_btn = self.wait.until(
+            EC.element_to_be_clickable((By.ID, "accountstatement_view"))
+        )
+        self._safe_click(view_btn)
+
+    def _export_statement_csv(self) -> str:
+        """
+        Export statement as CSV and wait for download.
+        
+        Returns:
+            Path to downloaded CSV file
+            
+        Raises:
+            TimeoutException: If CSV download times out
+        """
+        d = self.driver
+        
+        csv_btn = WebDriverWait(d, self.TIMEOUT_STANDARD).until(
+            EC.element_to_be_clickable((By.ID, "accountstatement_csvAcctStmt"))
+        )
+        self._safe_click(csv_btn)
+
+        # Wait for download
+        time.sleep(3)
+        csv_path = self.wait_newest_file(".csv", timeout=60.0)
+        
+        if not csv_path:
+            raise TimeoutException("Timed out waiting for IOB CSV download")
+        
+        self.info(f"Downloaded statement: {os.path.basename(csv_path)}")
+        time.sleep(5)  # Ensure download fully completes
+        
+        return csv_path
+
+    def _upload_to_cipherbank(self, csv_path: str) -> None:
+        """
+        Upload statement to CipherBank with retries.
+        
+        Args:
+            csv_path: Path to CSV file to upload
+        """
         max_attempts = 5
         cipherbank = get_cipherbank_client()
-        if cipherbank:
-            for attempt in range(1, max_attempts + 1):
-                with ErrorContext(
-                    f"uploading to CipherBank (attempt {attempt}/{max_attempts})",
-                    messenger=self.msgr,
+        
+        if not cipherbank:
+            logger.debug(
+                "[%s] CipherBank client not available - skipping upload",
+                self.alias
+            )
+            return
+
+        for attempt in range(1, max_attempts + 1):
+            with ErrorContext(
+                f"uploading to CipherBank (attempt {attempt}/{max_attempts})",
+                messenger=self.msgr,
+                alias=self.alias,
+                reraise=False
+            ):
+                cipherbank.upload_statement(
+                    bank_code=self.cred["bank_label"],
+                    account_number=self.cred["account_number"],
+                    file_path=csv_path,
                     alias=self.alias,
-                    reraise=False  # Don't crash worker on CipherBank failure
-                ):
-                    cipherbank.upload_statement(
-                        bank_code=self.cred["bank_label"],
-                        account_number=self.cred["account_number"],
-                        file_path=csv_path,
-                        alias=self.alias,
-                    )
-                    self.info(f"✅ CipherBank upload succeeded (attempt {attempt}/{max_attempts})")
-                    break  # Success - exit retry loop
-                
-                # If we get here, the attempt failed
-                if attempt < max_attempts:
-                    self.info(f"⏳ Retrying CipherBank upload in 2 seconds...")
-                    time.sleep(2)
-                else:
-                    # Final attempt failed
-                    self.error(
-                        f"❌ CipherBank upload failed after {max_attempts} attempts. "
-                        "Continuing with next cycle."
-                    )
-        else:
-            logger.debug("CipherBank client not available - skipping upload for %s", self.alias)
+                )
+                self.info(
+                    f"CipherBank upload successful (attempt {attempt}/{max_attempts})"
+                )
+                return  # Success
+            
+            # Retry delay
+            if attempt < max_attempts:
+                logger.info("[%s] Retrying CipherBank upload in 2 seconds...", self.alias)
+                time.sleep(2)
+
+        # All attempts failed
+        self.error(
+            f"CipherBank upload failed after {max_attempts} attempts. "
+            "Continuing with next cycle."
+        )
+
+    # ============================================================
+    # Balance Enquiry
+    # ============================================================
 
     def _balance_enquiry(self) -> None:
         """
-        Fetch balance from IOB - this is best-effort and won't crash the worker.
-        Use safe_operation in the caller for extra safety.
+        Fetch and update account balance.
+        
+        Flow:
+        1. Navigate to Balance Enquiry page
+        2. Click account link
+        3. Read balance from popup
+        4. Close popup and return to Account Statement
+        
+        This is a best-effort operation - failures won't crash the worker.
         """
         d = self.driver
 
-        # ============================================================
-        # Make sure we're on the IOB tab (DISABLED - NOT NEEDED WITHOUT AUTOBANK)
-        # ============================================================
-        # if self.iob_win:
-        #     with ErrorContext("switching to IOB window", messenger=self.msgr, alias=self.alias):
-        #         d.switch_to.window(self.iob_win)
-
-        # Scroll back to top
-        with ErrorContext("scrolling to top", messenger=self.msgr, alias=self.alias, reraise=False):
+        with ErrorContext(
+            "balance enquiry",
+            messenger=self.msgr,
+            alias=self.alias,
+            reraise=False
+        ):
+            # Scroll to top
             d.execute_script("window.scrollTo(0, 0);")
             time.sleep(0.5)
 
-        # Locate Balance Enquiry link
-        with ErrorContext("navigating to Balance Enquiry", messenger=self.msgr, alias=self.alias):
-            balance_link = WebDriverWait(d, 60).until(
+            # Navigate to Balance Enquiry
+            balance_link = WebDriverWait(d, self.TIMEOUT_LONG).until(
                 EC.element_to_be_clickable((By.LINK_TEXT, "Balance Enquiry"))
             )
-            d.execute_script("arguments[0].scrollIntoView({block: 'center'});", balance_link)
-            time.sleep(0.3)
-            try:
-                balance_link.click()
-            except Exception:
-                d.execute_script("arguments[0].click();", balance_link)
+            self._safe_click(balance_link)
 
-        # Click the specific account link
-        acctno = (self.cred.get("account_number") or "").strip()
-        with ErrorContext("clicking account link", messenger=self.msgr, alias=self.alias):
-            wait_long = WebDriverWait(d, 180)
-            if acctno:
-                acct_link = wait_long.until(
-                    EC.element_to_be_clickable(
-                        (By.XPATH, f"//a[contains(@href,'getBalance') and contains(.,'{acctno}')]")
-                    )
-                )
-            else:
-                acct_link = wait_long.until(
-                    EC.element_to_be_clickable((By.XPATH, "//a[contains(@href,'getBalance')]"))
-                )
+            # Click account link
+            self._click_balance_account_link()
 
-            d.execute_script("arguments[0].scrollIntoView({block:'center'});", acct_link)
-            time.sleep(0.2)
-            try:
-                acct_link.click()
-            except Exception:
-                d.execute_script("arguments[0].click();", acct_link)
+            # Read balance from popup
+            self._read_balance_popup()
 
-        # Wait for popup and read balance
-        with ErrorContext("reading balance", messenger=self.msgr, alias=self.alias, reraise=False):
-            tbl = WebDriverWait(d, 180).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "#dialogtbl table tr.querytr td"))
-            )
-            available = (tbl.text or "").strip()
-            if available:
-                self.info(f"💰 Balance: {available}")
-                self.last_balance = available
-
-        # Remove modal overlay
-        with ErrorContext("removing modal overlay", messenger=self.msgr, alias=self.alias, reraise=False):
+            # Clean up popup
             d.execute_script(
-                "document.querySelectorAll('.ui-widget-overlay, #dialogtbl').forEach(el => el.remove());"
+                "document.querySelectorAll('.ui-widget-overlay, #dialogtbl')"
+                ".forEach(el => el.remove());"
             )
 
-        # Navigate back to Account statement
-        with ErrorContext("navigating back to Account Statement", messenger=self.msgr, alias=self.alias, reraise=False):
-            stmt_link = WebDriverWait(d, 60).until(
-                EC.element_to_be_clickable((By.LINK_TEXT, "Account statement"))
+            # Return to Account Statement
+            self._navigate_to_account_statement()
+
+    def _click_balance_account_link(self) -> None:
+        """Click account link in Balance Enquiry page."""
+        d = self.driver
+        acctno = (self.cred.get("account_number") or "").strip()
+        
+        wait_long = WebDriverWait(d, self.TIMEOUT_EXTRA_LONG)
+        
+        if acctno:
+            acct_link = wait_long.until(
+                EC.element_to_be_clickable((
+                    By.XPATH,
+                    f"//a[contains(@href,'getBalance') and contains(.,'{acctno}')]"
+                ))
             )
-            d.execute_script("arguments[0].scrollIntoView({block:'center'});", stmt_link)
-            time.sleep(0.2)
-            try:
-                stmt_link.click()
-            except Exception:
-                d.execute_script("arguments[0].click();", stmt_link)
+        else:
+            acct_link = wait_long.until(
+                EC.element_to_be_clickable((
+                    By.XPATH,
+                    "//a[contains(@href,'getBalance')]"
+                ))
+            )
+
+        self._safe_click(acct_link)
+
+    def _read_balance_popup(self) -> None:
+        """Read balance from popup dialog."""
+        d = self.driver
+        
+        tbl = WebDriverWait(d, self.TIMEOUT_EXTRA_LONG).until(
+            EC.presence_of_element_located((
+                By.CSS_SELECTOR,
+                "#dialogtbl table tr.querytr td"
+            ))
+        )
+        
+        available = (tbl.text or "").strip()
+        if available:
+            self.info(f"Account balance: {available}")
+            self.last_balance = available
+
+    # ============================================================
+    # Helper Methods
+    # ============================================================
+
+    def _safe_click(self, element) -> None:
+        """
+        Click element with fallback to JavaScript click.
+        
+        Handles ElementClickInterceptedException by attempting
+        JavaScript click as fallback.
+        
+        Args:
+            element: WebElement to click
+        """
+        d = self.driver
+        
+        # Scroll into view
+        d.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
+        time.sleep(0.3)
+        
+        try:
+            element.click()
+        except ElementClickInterceptedException:
+            logger.debug("[%s] Click intercepted - using JavaScript", self.alias)
+            d.execute_script("arguments[0].click();", element)
+        except Exception:
+            # Last resort - force JavaScript click
+            d.execute_script("arguments[0].click();", element)
