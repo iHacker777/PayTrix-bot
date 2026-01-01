@@ -1,2 +1,210 @@
+# ============================================
+# CRITICAL: Credentials & Secrets
+# ============================================
+# NEVER commit these files - they contain sensitive data
+
+# Credentials CSV files (all variants)
+*credentials.csv
+tmb_credentials.csv
+payatom_bot/tmb_credentials.csv
+
+# Backup credentials files
+*.csv.bak
+*.csv.backup
+
+# ============================================
+# Chrome Browser Profiles & Cache
+# ============================================
+chrome-profiles/
+.chrome-profiles/
+profile_root/
+*.crx
+
+# ============================================
+# Downloads & Generated Files
+# ============================================
 downloads/
+*.xls
+*.xlsx
+*.csv
+!requirements.txt
+!**/SKILL.md
+
+# Screenshots (captured by workers)
+screenshots/
+*.png
+*.jpg
+*.jpeg
+
+# ============================================
+# Python
+# ============================================
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
 .venv/
+venv/
+ENV/
+env/
+.virtualenv/
+
+# Testing
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# Celery
+celerybeat-schedule
+celerybeat.pid
+
+# ============================================
+# IDEs & Editors
+# ============================================
+# VSCode
+.vscode/
+*.code-workspace
+
+# PyCharm
+.idea/
+*.iml
+*.iws
+.idea_modules/
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*~
+.*.swp
+
+# Emacs
+*~
+\#*\#
+.\#*
+
+# ============================================
+# Operating System Files
+# ============================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+.directory
+.Trash-*
+
+# ============================================
+# Logs & Debugging
+# ============================================
+*.log
+logs/
+*.log.*
+debug.log
+error.log
+
+# ============================================
+# Temporary Files
+# ============================================
+*.tmp
+*.temp
+*.bak
+*.backup
+*.old
+*.orig
+
+# ============================================
+# Documentation Build
+# ============================================
+docs/_build/
+site/
+
+# ============================================
+# Database Files (if any)
+# ============================================
+*.db
+*.sqlite
+*.sqlite3
+
+# ============================================
+# Security Keys & Certificates
+# ============================================
+*.pem
+*.key
+*.cert
+*.crt
+*.p12
+*.pfx
+
+# ============================================
+# Project-Specific
+# ============================================
+# Selenium WebDriver binaries
+chromedriver
+chromedriver.exe
+geckodriver
+geckodriver.exe
+
+# 2Captcha cache
+.2captcha_cache/
+
+# Worker state files (if any)
+worker_state/
+*.state
+
+# ============================================
+# Git Related
+# ============================================
+*.orig
+*.patch
+*.diff
