@@ -820,7 +820,7 @@ class IOBWorker(BaseWorker):
         
         available = (tbl.text or "").strip()
         if available:
-            self.info(f"Account balance: {available}")
+            self.info(f"💰: {available}")
             self.last_balance = available
 
     # ============================================================
