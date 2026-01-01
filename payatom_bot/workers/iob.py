@@ -494,7 +494,6 @@ class IOBWorker(BaseWorker):
         # ============================================================
         max_attempts = 5
         cipherbank = get_cipherbank_client()
-        
         if cipherbank:
             for attempt in range(1, max_attempts + 1):
                 with ErrorContext(

@@ -163,7 +163,7 @@ class Messenger:
     # —— public (thread-safe) ——
     def send_event(self, text: str, kind: str = "INFO"):
         """
-        Send an event message to Telegram.
+        Send an event message to Telegram .
         
         Args:
             text: Message text

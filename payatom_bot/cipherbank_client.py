@@ -480,9 +480,23 @@ class CipherBankClient:
             alias=alias,
             reraise=True
         ):
-            url = f"{self.upload_base_url}/statements/upload"  # CHANGED
+            # Base URL without query parameters
+            base_url = f"{self.upload_base_url}/statements/upload"
             
-            # Validate file exists before attempting upload
+            # Validate inputs
+            if not account_number or not account_number.strip():
+                error = ValueError(
+                    f"Account number is empty!\n"
+                    f"Worker: {alias}\n"
+                    f"Bank: {bank_code}"
+                )
+                self._send_error_alert(
+                    f"Upload Failed - Empty Account Number ({alias})",
+                    error,
+                    context=f"upload for {alias}"
+                )
+                raise error
+            
             if not os.path.exists(file_path):
                 error = FileNotFoundError(
                     f"Statement file not found: {file_path}\n"
@@ -504,51 +518,79 @@ class CipherBankClient:
             try:
                 token = self.get_token()
             except RuntimeError as e:
-                # Token error already sends its own alert
                 raise
             
+            # Get parser key from mapping
+            parser_key = PARSER_KEY_MAP.get(bank_code, bank_code.lower())
+            
+            # Get authenticated username
+            username = self.get_username()
+            if not username:
+                logger.warning("[%s] No username - using login username", alias)
+                username = self.username
+            
+            if not username or not username.strip():
+                error = ValueError(f"Username is empty! Worker: {alias}")
+                self._send_error_alert(
+                    f"Upload Failed - Empty Username ({alias})",
+                    error,
+                    context=f"upload for {alias}"
+                )
+                raise error
+            
             masked_account = account_number[-4:] if len(account_number) >= 4 else account_number
+            
+            # 🔹 BUILD URL WITH QUERY PARAMETERS (as shown in Swagger)
+            # Note: parameter name is 'accountNo', not 'accountNumber'!
+            params = {
+                'parserKey': parser_key,
+                'username': username,
+                'accountNo': account_number,  # 🔹 CRITICAL: Use 'accountNo' not 'accountNumber'
+            }
+            
             logger.info(
-                "[%s] Uploading to CipherBank: %s - Account ***%s (%.1f KB)",
+                "[%s] 📤 CipherBank Upload:\n"
+                "  URL: %s\n"
+                "  Params: parserKey=%s, username=%s, accountNo=***%s\n"
+                "  File: %s (%.1f KB)",
                 alias,
-                bank_code,
+                base_url,
+                parser_key,
+                username,
                 masked_account,
+                os.path.basename(file_path),
                 file_size_kb
             )
             
-            # Prepare and execute multipart upload with comprehensive error handling
+            # Prepare multipart upload
             try:
                 with open(file_path, 'rb') as f:
                     file_name = os.path.basename(file_path)
-                    # Get parser key from mapping, fallback to bank_code
-                    parser_key = PARSER_KEY_MAP.get(bank_code, bank_code)
-                    # Get authenticated username
-                    username = self.get_username()
-                    if not username:
-                        logger.warning(
-                            "[%s] No username available for upload - using default",
-                            alias
-                        )
-                        username = self.username  # Fallback to login username
+                    
+                    # 🔹 ONLY the file goes in files dict (not params!)
                     files = {
-                        'file': (file_name, f, 'application/octet-stream')
-                    }
-                    data = {
-                        'bankCode': bank_code,
-                        'accountNumber': account_number,
-                        'parserKey': parser_key,  # ADDED
-                        'username': username, 
-                    }
-                    headers = {
-                        'Authorization': f'Bearer {token}',
+                        'file': (file_name, f, 'text/csv')  # Use text/csv for CSV files
                     }
                     
-                    # Make request with timeout
+                    headers = {
+                        'Authorization': f'Bearer {token}',
+                        'accept': '*/*',  # As shown in Swagger
+                    }
+                    
+                    # 🔹 DEBUG: Show complete request details
+                    logger.info(
+                        "[%s] 📋 Request: POST %s?%s",
+                        alias,
+                        base_url,
+                        '&'.join(f"{k}={v}" for k, v in params.items())
+                    )
+                    
+                    # 🔹 Make request with params in URL (not in data!)
                     response = safe_operation(
                         lambda: requests.post(
-                            url,
-                            files=files,
-                            data=data,
+                            base_url,
+                            params=params,      # 🔹 Query parameters in URL
+                            files=files,        # 🔹 Only file in form data
                             headers=headers,
                             timeout=60,
                         ),
@@ -572,18 +614,17 @@ class CipherBankClient:
                         )
                         raise error
                     
+                    # Log the actual URL that was called
+                    logger.info("[%s] 🌐 Actual URL: %s", alias, response.url)
+                    
                     # Handle token expiry (401)
                     if response.status_code == 401:
                         error_msg = (
                             f"Token expired during upload\n"
                             f"Worker: {alias}\n"
-                            f"Bank: {bank_code}\n\n"
-                            f"Token will be refreshed automatically.\n"
-                            f"Please retry upload on next cycle."
+                            f"Token will be refreshed automatically."
                         )
                         logger.warning("[%s] %s", alias, error_msg)
-                        
-                        # Don't send alert for 401 - this is expected and will recover
                         raise RuntimeError(error_msg)
                     
                     # Handle other errors
@@ -593,31 +634,39 @@ class CipherBankClient:
                             f"CipherBank upload failed: HTTP {response.status_code}\n"
                             f"Worker: {alias}\n"
                             f"Bank: {bank_code}\n"
-                            f"Account: ***{masked_account}\n"
-                            f"File: {file_name} ({file_size_kb:.1f} KB)\n\n"
+                            f"Account: {account_number}\n"
+                            f"Parser: {parser_key}\n"
+                            f"Username: {username}\n"
+                            f"File: {file_name} ({file_size_kb:.1f} KB)\n"
+                            f"URL: {response.url}\n\n"
                         )
                         
                         if error_details:
                             error_msg += f"<b>Server Response:</b>\n{error_details}\n\n"
                         
-                        # Add troubleshooting for common errors
+                        # Add troubleshooting
                         if response.status_code == 400:
                             error_msg += (
                                 "<b>Possible Causes:</b>\n"
                                 "• Invalid file format\n"
-                                "• Missing required fields\n"
-                                "• Invalid bank code or account number"
+                                "• Missing required parameters\n"
+                                "• Invalid parser key or account number"
+                            )
+                        elif response.status_code == 422:
+                            error_msg += (
+                                "<b>Possible Causes:</b>\n"
+                                "• File format not recognized by parser\n"
+                                "• CSV structure doesn't match expected format\n"
+                                "• Invalid data in CSV file\n"
+                                "• Parser error processing the file"
                             )
                         elif response.status_code == 413:
                             error_msg += (
-                                "<b>Possible Causes:</b>\n"
-                                f"• File too large ({file_size_kb:.1f} KB)\n"
-                                "• Server upload limit exceeded"
+                                f"<b>File too large:</b> {file_size_kb:.1f} KB"
                             )
                         elif response.status_code >= 500:
                             error_msg += (
-                                "<b>Server Error:</b>\n"
-                                "CipherBank server is experiencing issues.\n"
+                                "<b>Server Error</b>\n"
                                 "Will retry automatically."
                             )
                         
@@ -629,18 +678,15 @@ class CipherBankClient:
                         )
                         raise error
                     
-                    logger.info("[%s] ✅ CipherBank upload successful", alias)
+                    logger.info("[%s] ✅ CipherBank upload successful (HTTP %d)", alias, response.status_code)
                     
-            except FileNotFoundError:
-                # Already handled above
+            except (FileNotFoundError, ValueError):
                 raise
             except requests.Timeout as e:
                 error_msg = (
                     f"CipherBank upload timeout after 60 seconds\n"
                     f"Worker: {alias}\n"
-                    f"Bank: {bank_code}\n"
-                    f"File: {os.path.basename(file_path)} ({file_size_kb:.1f} KB)\n\n"
-                    f"The file may be too large or network is slow."
+                    f"File: {os.path.basename(file_path)} ({file_size_kb:.1f} KB)"
                 )
                 error = RuntimeError(error_msg)
                 self._send_error_alert(
@@ -651,9 +697,8 @@ class CipherBankClient:
                 raise error from e
             except requests.RequestException as e:
                 error_msg = (
-                    f"CipherBank network error during upload\n"
+                    f"CipherBank network error\n"
                     f"Worker: {alias}\n"
-                    f"Bank: {bank_code}\n"
                     f"Error: {type(e).__name__}: {e}"
                 )
                 error = RuntimeError(error_msg)
@@ -662,8 +707,7 @@ class CipherBankClient:
                     error,
                     context=f"upload for {alias}"
                 )
-                raise error from e
-    
+                raise error from e    
     def _extract_error_details(self, response: requests.Response) -> str:
         """
         Extract error details from HTTP response.
