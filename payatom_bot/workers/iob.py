@@ -503,58 +503,63 @@ class IOBWorker(BaseWorker):
                 d.find_element(By.NAME, "loginId").send_keys(user)
                 d.find_element(By.NAME, "password").send_keys(self.cred["password"])
 
-    def _solve_and_submit_captcha(self) -> None:
-        """
-        Solve CAPTCHA and submit login form.
+def _solve_and_submit_captcha(self) -> None:
+    """
+    Solve CAPTCHA and submit login form.
+    
+    Attempts automatic solving via 2Captcha. Falls back to manual
+    solving via Telegram if automatic fails.
+    
+    Raises:
+        TimeoutException: If CAPTCHA solving fails or is incorrect
+    """
+    # Skip if stopping
+    if self.stop_evt.is_set():
+        logger.debug("[%s] Stop event set - skipping CAPTCHA solve", self.alias)
+        return
+    
+    d = self.driver
+    
+    with ErrorContext("solving CAPTCHA", messenger=self.msgr, alias=self.alias):
+        # Capture CAPTCHA image
+        img = WebDriverWait(d, self.TIMEOUT_CAPTCHA_WAIT).until(
+            EC.presence_of_element_located((By.ID, "captchaimg"))
+        )
         
-        Attempts automatic solving via 2Captcha. Falls back to manual
-        solving via Telegram if automatic fails.
+        # Scroll into view
+        d.execute_script("arguments[0].scrollIntoView(true);", img)
+        time.sleep(1)
+
+        # Re-locate after scroll
+        img = WebDriverWait(d, self.TIMEOUT_CAPTCHA_WAIT).until(
+            EC.visibility_of_element_located((By.ID, "captchaimg"))
+        )
+        img_bytes = img.screenshot_as_png
+
+        # Attempt automatic solving
+        solution = self._solve_captcha_automatic(img_bytes)
         
-        Raises:
-            TimeoutException: If CAPTCHA solving fails or is incorrect
-        """
-        d = self.driver
-        
-        with ErrorContext("solving CAPTCHA", messenger=self.msgr, alias=self.alias):
-            # Capture CAPTCHA image
-            img = WebDriverWait(d, self.TIMEOUT_CAPTCHA_WAIT).until(
-                EC.presence_of_element_located((By.ID, "captchaimg"))
+        if not solution:
+            # Fallback to manual solving via Telegram
+            self.msgr.send_photo(
+                BytesIO(img_bytes),
+                f"[{self.alias}] Please solve CAPTCHA for IOB login",
+                kind="CAPTCHA",
             )
-            
-            # Scroll into view
-            d.execute_script("arguments[0].scrollIntoView(true);", img)
-            time.sleep(1)
-
-            # Re-locate after scroll
-            img = WebDriverWait(d, self.TIMEOUT_CAPTCHA_WAIT).until(
-                EC.visibility_of_element_located((By.ID, "captchaimg"))
+            raise TimeoutException(
+                "CAPTCHA not solved automatically - manual entry required"
             )
-            img_bytes = img.screenshot_as_png
 
-            # Attempt automatic solving
-            solution = self._solve_captcha_automatic(img_bytes)
-            
-            if not solution:
-                # Fallback to manual solving via Telegram
-                self.msgr.send_photo(
-                    BytesIO(img_bytes),
-                    f"[{self.alias}] Please solve CAPTCHA for IOB login",
-                    kind="CAPTCHA",
-                )
-                raise TimeoutException(
-                    "CAPTCHA not solved automatically - manual entry required"
-                )
+        # Fill CAPTCHA
+        field = d.find_element(By.NAME, "captchaid")
+        field.clear()
+        field.send_keys(solution.strip().upper())
 
-            # Fill CAPTCHA
-            field = d.find_element(By.NAME, "captchaid")
-            field.clear()
-            field.send_keys(solution.strip().upper())
+        # Submit form
+        d.find_element(By.ID, "btnSubmit").click()
 
-            # Submit form
-            d.find_element(By.ID, "btnSubmit").click()
-
-            # Check for incorrect CAPTCHA error
-            self._check_captcha_error()
+        # Check for incorrect CAPTCHA error (with stop event protection)
+        self._check_captcha_error()
 
     def _solve_captcha_automatic(self, img_bytes: bytes) -> Optional[str]:
         """
@@ -594,39 +599,63 @@ class IOBWorker(BaseWorker):
         
         return None
 
-    def _check_captcha_error(self) -> None:
-        """
-        Check for incorrect CAPTCHA error message.
-        
-        Raises:
-            TimeoutException: If CAPTCHA was incorrect
-        """
-        d = self.driver
-        
+def _check_captcha_error(self) -> None:
+    """
+    Check for incorrect CAPTCHA error message.
+    
+    Raises:
+        TimeoutException: If CAPTCHA was incorrect
+    """
+    # Skip check if stopping
+    if self.stop_evt.is_set():
+        logger.debug("[%s] Stop event set - skipping CAPTCHA error check", self.alias)
+        return
+    
+    d = self.driver
+    
+    try:
+        # Check if driver session is still valid
         try:
-            err_span = WebDriverWait(d, self.TIMEOUT_ERROR_DETECTION).until(
-                EC.presence_of_element_located(
-                    (By.CSS_SELECTOR, "div.otpmsg span.red")
-                )
+            _ = d.session_id
+        except Exception:
+            # Driver session is dead - likely due to stop event
+            logger.debug("[%s] Driver session invalid - skipping CAPTCHA check", self.alias)
+            return
+        
+        err_span = WebDriverWait(d, self.TIMEOUT_ERROR_DETECTION).until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, "div.otpmsg span.red")
             )
+        )
+        
+        if (
+            "captcha entered is incorrect" in (err_span.text or "").lower()
+            and self._captcha_id
+        ):
+            self.error("CAPTCHA incorrect - reporting to 2Captcha and retrying")
+            if self.solver:
+                safe_operation(
+                    lambda: self.solver.report_bad(self._captcha_id),
+                    context="report bad CAPTCHA",
+                    default=None
+                )
+            self._cycle_tabs()
+            raise TimeoutException("CAPTCHA incorrect")
             
-            if (
-                "captcha entered is incorrect" in (err_span.text or "").lower()
-                and self._captcha_id
-            ):
-                self.error("CAPTCHA incorrect - reporting to 2Captcha and retrying")
-                if self.solver:
-                    safe_operation(
-                        lambda: self.solver.report_bad(self._captcha_id),
-                        context="report bad CAPTCHA",
-                        default=None
-                    )
-                self._cycle_tabs()
-                raise TimeoutException("CAPTCHA incorrect")
-                
-        except TimeoutException:
-            # No error shown - login successful
-            pass
+    except TimeoutException:
+        # No error shown - login successful
+        pass
+    except Exception as e:
+        # If stop event is set, suppress all errors
+        if self.stop_evt.is_set():
+            logger.debug(
+                "[%s] Exception during CAPTCHA check (shutdown in progress): %s",
+                self.alias,
+                type(e).__name__
+            )
+        else:
+            # Re-raise unexpected errors during normal operation
+            raise
 
     # ============================================================
     # Statement Download and Upload

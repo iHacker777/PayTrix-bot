@@ -57,6 +57,7 @@ import logging
 import os
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
+import asyncio
 
 from telegram import Update
 from telegram.constants import ParseMode
@@ -628,6 +629,12 @@ async def stopall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     - Prevents race conditions between stop() and worker operations
     - Comprehensive audit logging of bulk operations
     
+    Implementation Details:
+    - Calls w.stop() to set stop_evt and quit driver
+    - Sleeps 0.5s to allow worker threads to detect stop event
+    - Waits up to 10s for each thread to finish gracefully
+    - Cleans up worker registry regardless of success/failure
+    
     Security: Comprehensive audit logging of bulk operations
     """
     workers = _get_registry(context)
@@ -642,14 +649,21 @@ async def stopall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 default=False,
             ):
                 # Set stop event first to signal worker to exit
+                # This calls stop_evt.set() and driver.quit()
                 w.stop()
                 
                 # Give worker thread a moment to detect stop_evt before join
                 # This prevents race conditions where worker is mid-operation
+                # allowing it to:
+                # - Check stop_evt at various checkpoints
+                # - Skip screenshots and error logging
+                # - Suppress expected Selenium errors
+                # - Exit gracefully from current operation
                 await asyncio.sleep(0.5)
                 
                 # Wait for worker thread to finish gracefully
                 # Increased timeout to allow for cleanup operations
+                # (previous timeout was 5.0s, now 10.0s)
                 w.join(timeout=10.0)
                 
                 stopped.append(alias)
@@ -659,6 +673,7 @@ async def stopall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             errors.append(alias)
         finally:
             # Clean up registry entry regardless of success/failure
+            # This ensures workers don't remain in registry after stop attempt
             workers.pop(alias, None)
 
     if not stopped and not errors:
