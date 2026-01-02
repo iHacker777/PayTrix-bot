@@ -929,6 +929,11 @@ async def reset_alerts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     Examples:
         /reset_alerts madras_tmb
         /reset_alerts all
+    
+    Enhanced Features:
+    - Includes user context in audit logs
+    - Tracks who triggered the reset
+    - Professional logging with user information
     """
     if not context.args:
         await update.message.reply_text(
@@ -947,51 +952,74 @@ async def reset_alerts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
 
+    # Get user context for audit logging
+    user_id = update.effective_user.id if update.effective_user else None
+    username = update.effective_user.username if update.effective_user else None
+    chat_id = update.effective_chat.id if update.effective_chat else None
+
     target = context.args[0].strip().lower()
 
     if target == "all":
-        # Reset all alerts
+        # Reset all alerts with user context
         count = len(balance_monitor.triggered_thresholds)
+        
+        # Store aliases before clearing
+        reset_aliases = list(balance_monitor.triggered_thresholds.keys())
+        
+        # Clear all
         balance_monitor.triggered_thresholds.clear()
+        balance_monitor.last_alert_time.clear()
 
         await update.message.reply_text(
-            f"✅ Reset balance alerts for **all** aliases\n" f"({count} alias(es) cleared)",
+            f"✅ Reset balance alerts for **all** aliases\n" 
+            f"({count} alias(es) cleared)",
             parse_mode="Markdown",
         )
         
-        logger.info("Reset all balance alerts")
-        
-        # Audit log for bulk reset
+        # Enhanced audit log with user context
         log_audit_event(
-            "ALERTS_BULK_RESET",
-            {"count": count, "method": "command"},
+            "BALANCE_ALERTS_BULK_RESET",
+            {
+                "count": count,
+                "reset_aliases": reset_aliases,
+                "user_id": user_id,
+                "username": username,
+                "chat_id": chat_id,
+            },
             level=logging.INFO,
+        )
+        
+        # Enhanced logging with user context
+        logger.info(
+            "Reset all balance alerts (%d aliases) - triggered by user_id=%s, username=%s",
+            count,
+            user_id,
+            username or 'unknown',
         )
 
     else:
-        # Reset specific alias
+        # Reset specific alias with user context
         alias = context.args[0].strip()
 
         if alias in balance_monitor.triggered_thresholds:
-            balance_monitor.reset_alerts_for_alias(alias)
+            # Use enhanced reset method with user context
+            balance_monitor.reset_alerts_for_alias(
+                alias=alias,
+                user_id=user_id,
+                username=username,
+                chat_id=chat_id,
+            )
             
             await update.message.reply_text(
                 f"✅ Reset balance alerts for `{alias}`\n\n"
                 "ℹ️ New alerts will be sent when thresholds are crossed again.",
                 parse_mode="Markdown",
             )
-            
-            # Audit log for alert reset
-            log_audit_event(
-                "ALERT_RESET",
-                {"alias": alias, "method": "command"},
-                level=logging.INFO,
-            )
         else:
             await update.message.reply_text(
-                f"ℹ️ No active alerts for `{alias}`", parse_mode="Markdown"
+                f"ℹ️ No active alerts for `{alias}`", 
+                parse_mode="Markdown",
             )
-
 
 @telegram_handler_error_wrapper
 async def check_balances_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
