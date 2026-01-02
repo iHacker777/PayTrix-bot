@@ -11,6 +11,7 @@ Provides shared functionality for all bank workers:
 - Retry logic with error handling
 - Worker-specific logging with PII masking
 - Audit trail for critical operations
+- Graceful shutdown handling
 """
 from __future__ import annotations
 
@@ -49,6 +50,7 @@ class BaseWorker(threading.Thread):
     - Worker-specific logging to dedicated log files
     - Automatic audit trail for critical operations
     - Thread-safe operations
+    - Race condition protection for clean shutdown
     
     Concrete subclasses should implement their own run() method which calls:
       - self._run_with_retries(step, label)
@@ -253,7 +255,8 @@ class BaseWorker(threading.Thread):
         Stop worker gracefully.
         
         Sets stop event flag and closes browser. Logs shutdown event
-        to audit trail.
+        to audit trail. Includes protection against duplicate quit()
+        calls and checks driver availability before closing.
         """
         if not self.stop_evt.is_set():
             self.worker_logger.info("Stopping worker...")
@@ -266,11 +269,28 @@ class BaseWorker(threading.Thread):
         
         self.stop_evt.set()
         
+        # Check if driver is still alive before attempting to quit
         try:
+            # Try to access driver session to verify it's still active
+            _ = self.driver.session_id
             self.driver.quit()
             self.worker_logger.debug("Chrome WebDriver closed")
+        except AttributeError:
+            # Driver doesn't have session_id attribute (already quit or never initialized)
+            self.worker_logger.debug("WebDriver already closed or not initialized")
         except Exception as e:
-            self.worker_logger.warning("Error closing WebDriver: %s", e)
+            # Any other error during quit - log at debug level to avoid spam
+            # This is expected during shutdown race conditions
+            error_msg = str(e)
+            if any(indicator in error_msg for indicator in [
+                "invalid session id",
+                "Session not created",
+                "no such session",
+                "chrome not reachable"
+            ]):
+                self.worker_logger.debug("WebDriver session already terminated")
+            else:
+                self.worker_logger.debug("WebDriver cleanup: %s", str(e))
 
     # ═══════════════════════════════════════════════════════════
     # Retry Wrapper
@@ -293,6 +313,7 @@ class BaseWorker(threading.Thread):
         - Screenshot capture on failure
         - Detailed error logging
         - Telegram notification on failure
+        - Graceful handling of stop events
         
         Args:
             func: Function to execute (should take no arguments)
@@ -330,6 +351,25 @@ class BaseWorker(threading.Thread):
             except Exception as e:
                 attempt += 1
                 
+                # Check if this is a shutdown-related error
+                if self.stop_evt.is_set():
+                    error_msg = str(e)
+                    # Suppress common Selenium errors during shutdown
+                    if any(indicator in error_msg for indicator in [
+                        "Connection refused",
+                        "Failed to establish a new connection",
+                        "MaxRetryError",
+                        "target machine actively refused",
+                        "invalid session id",
+                        "chrome not reachable"
+                    ]):
+                        self.worker_logger.debug(
+                            "Selenium error during shutdown (expected): %s - %s",
+                            label,
+                            type(e).__name__
+                        )
+                        raise  # Re-raise to exit retry loop
+                
                 # Format detailed error message
                 tb = traceback.format_exc()
                 
@@ -343,27 +383,29 @@ class BaseWorker(threading.Thread):
                 )
                 self.worker_logger.debug("Traceback:\n%s", tb)
                 
-                # Send error to Telegram
-                msg = (
-                    "⚠️ Oops! There seems to be an issue.\n"
-                    "Please contact the dev team with the details below.\n\n"
-                    f"Context: {label}\n"
-                    f"Attempt: {attempt}/{max_retries}\n"
-                    f"Error: {type(e).__name__}: {e}\n"
-                    f"Traceback:\n{tb}"
-                )
-                self.error(msg)
+                # Send error to Telegram (skip if stopping)
+                if not self.stop_evt.is_set():
+                    msg = (
+                        "⚠️ Oops! There seems to be an issue.\n"
+                        "Please contact the dev team with the details below.\n\n"
+                        f"Context: {label}\n"
+                        f"Attempt: {attempt}/{max_retries}\n"
+                        f"Error: {type(e).__name__}: {e}\n"
+                        f"Traceback:\n{tb}"
+                    )
+                    self.error(msg)
 
-                # Take screenshots for debugging
-                try:
-                    self.screenshot_all_tabs(
-                        f"{label} failure (attempt {attempt}/{max_retries})"
-                    )
-                except Exception as screenshot_error:
-                    self.worker_logger.warning(
-                        "Failed to capture screenshots: %s",
-                        screenshot_error
-                    )
+                # Take screenshots for debugging (skip if stopping)
+                if not self.stop_evt.is_set():
+                    try:
+                        self.screenshot_all_tabs(
+                            f"{label} failure (attempt {attempt}/{max_retries})"
+                        )
+                    except Exception as screenshot_error:
+                        self.worker_logger.warning(
+                            "Failed to capture screenshots: %s",
+                            screenshot_error
+                        )
 
                 # Check if we should retry
                 if attempt >= max_retries:
@@ -376,7 +418,7 @@ class BaseWorker(threading.Thread):
                     raise
                 
                 if self.stop_evt.is_set():
-                    self.worker_logger.info("Stop requested - aborting retries")
+                    self.worker_logger.debug("Stop event set - aborting retries for %s", label)
                     raise
 
                 # Sleep before retry (could add exponential backoff here)
@@ -386,7 +428,11 @@ class BaseWorker(threading.Thread):
                     label,
                     sleep_time
                 )
-                time.sleep(sleep_time)
+                
+                # Interruptible sleep - check stop event periodically
+                sleep_end = time.time() + sleep_time
+                while time.time() < sleep_end and not self.stop_evt.is_set():
+                    time.sleep(0.5)
 
     # ═══════════════════════════════════════════════════════════
     # Screenshot Helper
@@ -398,15 +444,38 @@ class BaseWorker(threading.Thread):
         
         Takes screenshots of all open tabs and sends them to Telegram
         for debugging. Useful for diagnosing errors in headless mode.
+        Gracefully handles stop events and driver issues.
         
         Args:
             reason: Description of why screenshot was taken
         """
+        # Skip if stop event is set
+        if self.stop_evt.is_set():
+            self.worker_logger.debug("Stop event set - skipping screenshots")
+            return
+        
+        # Check if driver is still alive
+        try:
+            _ = self.driver.session_id
+        except Exception:
+            self.worker_logger.debug("Driver not available for screenshots")
+            return
+        
         self.worker_logger.debug("Capturing screenshots of all tabs: %s", reason)
         
         screenshot_count = 0
         
-        for h in self.driver.window_handles:
+        try:
+            handles = self.driver.window_handles
+        except Exception as e:
+            self.worker_logger.warning("Cannot access window handles: %s", e)
+            return
+        
+        for h in handles:
+            # Check stop event before each screenshot
+            if self.stop_evt.is_set():
+                break
+                
             try:
                 self.driver.switch_to.window(h)
                 
@@ -464,14 +533,14 @@ class BaseWorker(threading.Thread):
         
         Polls the worker's download directory until a file with the specified
         suffix appears, then returns its full path. Useful for waiting for
-        downloads to complete.
+        downloads to complete. Respects stop event for graceful shutdown.
         
         Args:
             suffix: File extension to look for (e.g., '.csv', '.xls')
             timeout: Maximum time to wait in seconds
             
         Returns:
-            Full path to the newest file, or None if timeout occurs
+            Full path to the newest file, or None if timeout occurs or stop event set
         """
         self.worker_logger.debug(
             "Waiting for file with suffix '%s' (timeout: %.0fs)",
@@ -525,6 +594,10 @@ class BaseWorker(threading.Thread):
 
             time.sleep(1.0)
         
+        if self.stop_evt.is_set():
+            self.worker_logger.debug("Stop event set - aborting file wait")
+            return None
+        
         if latest_path:
             return latest_path
         else:
@@ -548,7 +621,20 @@ class BaseWorker(threading.Thread):
         or session timeouts.
         
         This is a common recovery pattern used by many workers.
+        Includes protection against race conditions during shutdown.
         """
+        # Don't cycle if stop event is set
+        if self.stop_evt.is_set():
+            self.worker_logger.debug("Stop event set - skipping tab cycle")
+            return
+        
+        # Check if driver is still alive
+        try:
+            _ = self.driver.session_id
+        except Exception:
+            self.worker_logger.debug("Driver not available for tab cycling")
+            return
+        
         self.worker_logger.info("Cycling browser tabs to reset session")
         
         try:
@@ -556,6 +642,11 @@ class BaseWorker(threading.Thread):
             
             if not handles_before:
                 self.worker_logger.warning("No windows to cycle - driver may be closed")
+                return
+
+            # Check stop event before proceeding
+            if self.stop_evt.is_set():
+                self.worker_logger.debug("Stop event detected during tab cycle prep")
                 return
 
             # Open new blank tab
@@ -578,6 +669,11 @@ class BaseWorker(threading.Thread):
             # Close all old tabs
             closed_count = 0
             for h in handles_before:
+                # Check stop event before each close operation
+                if self.stop_evt.is_set():
+                    self.worker_logger.debug("Stop event detected during tab cleanup")
+                    break
+                    
                 try:
                     self.driver.switch_to.window(h)
                     self.driver.close()
@@ -586,19 +682,36 @@ class BaseWorker(threading.Thread):
                     self.worker_logger.debug("Failed to close old tab: %s", e)
 
             # Switch to fresh tab and reset state
-            self.driver.switch_to.window(new_handle)
-            self.logged_in = False
-            
-            self.worker_logger.info(
-                "Browser tabs cycled: closed %d tabs, will re-login on next attempt",
-                closed_count
-            )
+            try:
+                self.driver.switch_to.window(new_handle)
+                self.logged_in = False
+                
+                self.worker_logger.info(
+                    "Browser tabs cycled: closed %d tabs, will re-login on next attempt",
+                    closed_count
+                )
+            except Exception as e:
+                # If stop event is set, this is expected
+                if self.stop_evt.is_set():
+                    self.worker_logger.debug("Tab switch interrupted by stop event")
+                else:
+                    self.worker_logger.error(
+                        "Failed to switch to new tab: %s",
+                        e,
+                        exc_info=True
+                    )
+                    # Set stop flag if tab cycling fails critically
+                    self.stop_evt.set()
             
         except Exception as e:
-            self.worker_logger.error(
-                "Failed to cycle tabs: %s",
-                e,
-                exc_info=True
-            )
-            # Set stop flag if tab cycling fails critically
-            self.stop_evt.set()
+            # If stop event is set, this is expected - don't log as error
+            if self.stop_evt.is_set():
+                self.worker_logger.debug("Tab cycle interrupted by stop event")
+            else:
+                self.worker_logger.error(
+                    "Failed to cycle tabs: %s",
+                    e,
+                    exc_info=True
+                )
+                # Set stop flag if tab cycling fails critically
+                self.stop_evt.set()

@@ -618,9 +618,15 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 @telegram_handler_error_wrapper
 async def stopall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Stop all running workers.
+    Stop all running workers gracefully.
     
     Command: /stopall
+    
+    Features:
+    - Sets stop event flag before joining threads
+    - Allows workers time to detect stop event and exit cleanly
+    - Prevents race conditions between stop() and worker operations
+    - Comprehensive audit logging of bulk operations
     
     Security: Comprehensive audit logging of bulk operations
     """
@@ -635,14 +641,24 @@ async def stopall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 context=f"check if {alias} is alive",
                 default=False,
             ):
+                # Set stop event first to signal worker to exit
                 w.stop()
-                w.join(timeout=5.0)
+                
+                # Give worker thread a moment to detect stop_evt before join
+                # This prevents race conditions where worker is mid-operation
+                await asyncio.sleep(0.5)
+                
+                # Wait for worker thread to finish gracefully
+                # Increased timeout to allow for cleanup operations
+                w.join(timeout=10.0)
+                
                 stopped.append(alias)
                 logger.info("Stopped worker: alias=%s", alias)
         except Exception as e:
             logger.exception("Error stopping worker %s", alias)
             errors.append(alias)
         finally:
+            # Clean up registry entry regardless of success/failure
             workers.pop(alias, None)
 
     if not stopped and not errors:
@@ -668,7 +684,6 @@ async def stopall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             },
             level=logging.WARNING if errors else logging.INFO,
         )
-
 
 @telegram_handler_error_wrapper
 async def running_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -8,11 +8,13 @@ Supports both retail and corporate banking interfaces with:
 - Robust error recovery with retries and screenshots
 - CipherBank statement upload integration
 - Balance monitoring with alerts
+- Graceful shutdown handling for clean stop operations
 
 Architecture:
 - Inherits from BaseWorker for common Selenium/Telegram functionality
 - Uses ErrorContext for comprehensive error handling
 - Thread-safe operations for concurrent worker management
+- Race condition protection for clean shutdown
 """
 from __future__ import annotations
 
@@ -125,6 +127,7 @@ class IOBWorker(BaseWorker):
         4. Handle session timeouts and errors
         
         Stops after MAX_OUTER_RETRIES consecutive failures.
+        Includes graceful shutdown handling to prevent error spam.
         """
         self.info("Starting IOB automation")
         retry_count = 0
@@ -140,11 +143,20 @@ class IOBWorker(BaseWorker):
                     while not self.stop_evt.is_set():
                         # Check for server-side logout
                         self._check_logged_out_and_cycle()
+                        
+                        # Check stop event before expensive operations
+                        if self.stop_evt.is_set():
+                            logger.debug("[%s] Stop event detected - exiting loop", self.alias)
+                            break
 
                         # Download and upload statement
                         self._download_and_upload_statement()
 
                         # Check again before balance enquiry
+                        if self.stop_evt.is_set():
+                            logger.debug("[%s] Stop event detected before balance enquiry", self.alias)
+                            break
+                            
                         self._check_logged_out_and_cycle()
 
                         # Balance enquiry (best-effort)
@@ -157,9 +169,20 @@ class IOBWorker(BaseWorker):
                         if balance_result is None:
                             logger.debug("[%s] Balance enquiry skipped", self.alias)
 
-                        time.sleep(self.CYCLE_SLEEP_SECONDS)
+                        # Check stop event before sleep
+                        if self.stop_evt.is_set():
+                            logger.debug("[%s] Stop event detected - skipping sleep", self.alias)
+                            break
+                        
+                        # Interruptible sleep
+                        self._interruptible_sleep(self.CYCLE_SLEEP_SECONDS)
                         
                 except TimeoutException as e:
+                    # If stop event is set, this is expected - don't log as error
+                    if self.stop_evt.is_set():
+                        logger.debug("[%s] Timeout during shutdown (expected)", self.alias)
+                        break
+                    
                     retry_count += 1
                     logger.warning(
                         "[%s] Timeout/logged-out (retry %d/%d): %s",
@@ -176,27 +199,50 @@ class IOBWorker(BaseWorker):
                         )
                         return
                     
-                    # Screenshot and reset
-                    try:
-                        self.screenshot_all_tabs(
-                            f"IOB error - retry {retry_count}/{self.MAX_OUTER_RETRIES}"
-                        )
-                    except Exception:
-                        pass
+                    # Screenshot and reset (skip if stopping)
+                    if not self.stop_evt.is_set():
+                        try:
+                            self.screenshot_all_tabs(
+                                f"IOB error - retry {retry_count}/{self.MAX_OUTER_RETRIES}"
+                            )
+                        except Exception:
+                            pass
                     
                     self._cycle_tabs()
                     
                 except Exception as e:
+                    # If stop event is set, suppress Selenium connection errors
+                    if self.stop_evt.is_set():
+                        error_msg = str(e)
+                        # Check if this is a Selenium connection error during shutdown
+                        if any(indicator in error_msg for indicator in [
+                            "Connection refused",
+                            "Failed to establish a new connection",
+                            "MaxRetryError",
+                            "target machine actively refused",
+                            "invalid session id",
+                            "chrome not reachable",
+                            "Session not created"
+                        ]):
+                            logger.debug(
+                                "[%s] Selenium connection error during shutdown (expected): %s",
+                                self.alias,
+                                type(e).__name__
+                            )
+                            break
+                    
                     retry_count += 1
                     self.error(
                         f"Loop error (retry {retry_count}/{self.MAX_OUTER_RETRIES}): "
                         f"{type(e).__name__}: {e}"
                     )
                     
-                    try:
-                        self.screenshot_all_tabs("IOB error")
-                    except Exception:
-                        pass
+                    # Screenshot (skip if stopping)
+                    if not self.stop_evt.is_set():
+                        try:
+                            self.screenshot_all_tabs("IOB error")
+                        except Exception:
+                            pass
 
                     if retry_count > self.MAX_OUTER_RETRIES:
                         self.error(
@@ -208,11 +254,26 @@ class IOBWorker(BaseWorker):
                     self._cycle_tabs()
                     
         finally:
-            self.stop()
+            # Only call stop() if not already stopped
+            if not self.stop_evt.is_set():
+                self.stop()
 
     # ============================================================
     # Session Management
     # ============================================================
+
+    def _interruptible_sleep(self, seconds: float) -> None:
+        """
+        Sleep for specified duration while checking stop event.
+        
+        Allows immediate response to stop commands during sleep periods.
+        
+        Args:
+            seconds: Number of seconds to sleep
+        """
+        sleep_end = time.time() + seconds
+        while time.time() < sleep_end and not self.stop_evt.is_set():
+            time.sleep(0.5)
 
     def _cycle_tabs(self) -> None:
         """
@@ -223,8 +284,14 @@ class IOBWorker(BaseWorker):
         or session timeouts.
         
         This method is actively used for error recovery throughout
-        the worker lifecycle.
+        the worker lifecycle. Includes protection against shutdown
+        race conditions.
         """
+        # Don't cycle if stop event is set
+        if self.stop_evt.is_set():
+            logger.debug("[%s] Stop event set - skipping tab cycle", self.alias)
+            return
+        
         d = self.driver
         
         with ErrorContext(
@@ -233,6 +300,13 @@ class IOBWorker(BaseWorker):
             alias=self.alias,
             reraise=False
         ):
+            # Check if driver is still alive
+            try:
+                _ = d.session_id
+            except Exception:
+                logger.debug("[%s] Driver not available for tab cycling", self.alias)
+                return
+            
             handles_before = safe_operation(
                 lambda: list(d.window_handles),
                 context=f"get window handles for {self.alias}",
@@ -241,6 +315,11 @@ class IOBWorker(BaseWorker):
             
             if not handles_before:
                 logger.warning("[%s] No windows to cycle; driver may be closed", self.alias)
+                return
+
+            # Check stop event before proceeding
+            if self.stop_evt.is_set():
+                logger.debug("[%s] Stop event detected during tab cycle prep", self.alias)
                 return
 
             # Open new blank tab
@@ -270,6 +349,11 @@ class IOBWorker(BaseWorker):
 
             # Close all old tabs
             for h in handles_before:
+                # Check stop event before each close operation
+                if self.stop_evt.is_set():
+                    logger.debug("[%s] Stop event detected during tab cleanup", self.alias)
+                    break
+                    
                 try:
                     d.switch_to.window(h)
                     d.close()
@@ -284,8 +368,12 @@ class IOBWorker(BaseWorker):
                 self.logged_in = False
                 self.info("Browser tabs cycled - will re-login on next loop")
             except Exception as e:
-                logger.error("[%s] Failed to switch to new tab: %s", self.alias, e)
-                self.stop_evt.set()
+                # If stop event is set, this is expected
+                if self.stop_evt.is_set():
+                    logger.debug("[%s] Tab switch interrupted by stop event", self.alias)
+                else:
+                    logger.error("[%s] Failed to switch to new tab: %s", self.alias, e)
+                    self.stop_evt.set()
 
     def _check_logged_out_and_cycle(self) -> None:
         """
@@ -298,6 +386,10 @@ class IOBWorker(BaseWorker):
         Raises:
             TimeoutException: If logged-out message detected
         """
+        # Skip check if stopping
+        if self.stop_evt.is_set():
+            return
+        
         source = safe_operation(
             lambda: self.driver.page_source,
             context=f"get page source for {self.alias}",
@@ -329,6 +421,11 @@ class IOBWorker(BaseWorker):
             RuntimeError: If login fails
             TimeoutException: If page elements not found
         """
+        # Check stop event before login attempt
+        if self.stop_evt.is_set():
+            logger.debug("[%s] Stop event set - skipping login", self.alias)
+            return
+        
         d = self.driver
         w = self.wait
 
@@ -549,6 +646,11 @@ class IOBWorker(BaseWorker):
         Uses CipherBank for statement processing. AutoBank upload
         is deprecated and has been removed.
         """
+        # Check stop event before starting
+        if self.stop_evt.is_set():
+            logger.debug("[%s] Stop event set - skipping statement download", self.alias)
+            return
+        
         d = self.driver
 
         with ErrorContext(
@@ -695,6 +797,11 @@ class IOBWorker(BaseWorker):
         Args:
             csv_path: Path to CSV file to upload
         """
+        # Skip upload if stopping
+        if self.stop_evt.is_set():
+            logger.debug("[%s] Stop event set - skipping CipherBank upload", self.alias)
+            return
+        
         max_attempts = 5
         cipherbank = get_cipherbank_client()
         
@@ -706,6 +813,16 @@ class IOBWorker(BaseWorker):
             return
 
         for attempt in range(1, max_attempts + 1):
+            # Check stop event before each attempt
+            if self.stop_evt.is_set():
+                logger.debug(
+                    "[%s] Stop event set - aborting CipherBank upload (attempt %d/%d)",
+                    self.alias,
+                    attempt,
+                    max_attempts
+                )
+                return
+            
             with ErrorContext(
                 f"uploading to CipherBank (attempt {attempt}/{max_attempts})",
                 messenger=self.msgr,
@@ -750,6 +867,11 @@ class IOBWorker(BaseWorker):
         
         This is a best-effort operation - failures won't crash the worker.
         """
+        # Skip if stopping
+        if self.stop_evt.is_set():
+            logger.debug("[%s] Stop event set - skipping balance enquiry", self.alias)
+            return
+        
         d = self.driver
 
         with ErrorContext(
