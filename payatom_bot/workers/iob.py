@@ -7,7 +7,7 @@ Supports both retail and corporate banking interfaces with:
 - Session management with logged-out detection
 - Robust error recovery with retries and screenshots
 - CipherBank statement upload integration
-- Balance monitoring with alerts
+- Balance monitoring with threshold alerts
 - Graceful shutdown handling for clean stop operations
 
 Architecture:
@@ -15,13 +15,53 @@ Architecture:
 - Uses ErrorContext for comprehensive error handling
 - Thread-safe operations for concurrent worker management
 - Race condition protection for clean shutdown
+- Enterprise-grade logging with PII masking
+- Comprehensive audit trail for compliance
+
+Example Usage:
+    ```python
+    from payatom_bot.workers.iob import IOBWorker
+    from payatom_bot.messaging import Messenger
+    
+    # Retail mode
+    worker = IOBWorker(
+        bot=bot,
+        chat_id=12345,
+        alias="my_iob_account",
+        cred={
+            "username": "USER123",
+            "password": "******",
+            "account_number": "1234567890",
+            "bank_label": "IOB"
+        },
+        messenger=messenger,
+        profile_dir="/path/to/profile",
+        two_captcha=solver
+    )
+    
+    # Corporate mode
+    corporate_worker = IOBWorker(
+        bot=bot,
+        chat_id=12345,
+        alias="company_iobcorp",
+        cred={
+            "login_id": "CORP123",
+            "user_id": "USER456",
+            "password": "******",
+            "account_number": "9876543210",
+            "bank_label": "IOB CORPORATE"
+        },
+        messenger=messenger,
+        profile_dir="/path/to/profile",
+        two_captcha=solver
+    )
+    ```
 """
 from __future__ import annotations
 
 import os
 import re
 import time
-import logging
 from io import BytesIO
 from datetime import datetime, timedelta
 from typing import Optional
@@ -29,14 +69,24 @@ from typing import Optional
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, ElementClickInterceptedException
+from selenium.common.exceptions import (
+    TimeoutException,
+    ElementClickInterceptedException,
+)
+from selenium.webdriver.remote.webelement import WebElement
 
-from ..cipherbank_client import get_cipherbank_client 
+from ..balance_monitor import parse_balance_amount, THRESHOLDS
+from ..cipherbank_client import get_cipherbank_client
 from ..worker_base import BaseWorker
 from ..captcha_solver import TwoCaptcha
-from ..error_handler import ErrorContext, safe_operation
-
-logger = logging.getLogger(__name__)
+from ..error_handler import (
+    ErrorContext,
+    ErrorMetadata,
+    ErrorSeverity,
+    ErrorCategory,
+    safe_operation,
+)
+from ..logging_config import log_audit_event
 
 
 class IOBWorker(BaseWorker):
@@ -57,7 +107,11 @@ class IOBWorker(BaseWorker):
         bank_label: str - "IOB" or "IOB CORPORATE"
     """
 
-    # Class constants
+    # ============================================================
+    # Class Constants
+    # ============================================================
+
+    # URLs
     LOGIN_URL = "https://netbanking.iob.bank.in/ibanking/html/index.html"
     
     # Timeout values (seconds)
@@ -74,6 +128,27 @@ class IOBWorker(BaseWorker):
     # CAPTCHA configuration
     CAPTCHA_MIN_LENGTH = 6
     CAPTCHA_MAX_LENGTH = 6
+    
+    # Page element identifiers
+    CAPTCHA_IMAGE_ID = "captchaimg"
+    CAPTCHA_FIELD_NAME = "captchaid"
+    SUBMIT_BUTTON_ID = "btnSubmit"
+    ACCOUNT_DROPDOWN_ID = "accountNo"
+    FROM_DATE_ID = "fromDate"
+    TO_DATE_ID = "toDate"
+    VIEW_BUTTON_ID = "accountstatement_view"
+    CSV_BUTTON_ID = "accountstatement_csvAcctStmt"
+    
+    # Navigation text
+    NAV_CONTINUE_TEXT = "Continue to Internet Banking Home Page"
+    NAV_PERSONAL_LOGIN = "Personal Login"
+    NAV_CORPORATE_LOGIN = "Corporate Login"
+    NAV_ACCOUNT_STATEMENT = "Account statement"
+    NAV_BALANCE_ENQUIRY = "Balance Enquiry"
+    
+    # Error messages
+    ERROR_LOGGED_OUT = "You are Logged OUT of internet banking"
+    ERROR_CAPTCHA_INCORRECT = "captcha entered is incorrect"
 
     def __init__(
         self,
@@ -97,6 +172,9 @@ class IOBWorker(BaseWorker):
             messenger: Messenger instance for notifications
             profile_dir: Chrome profile directory path
             two_captcha: Optional 2Captcha solver instance
+            
+        Raises:
+            ValueError: If required credentials are missing
         """
         super().__init__(
             bot=bot,
@@ -106,11 +184,41 @@ class IOBWorker(BaseWorker):
             messenger=messenger,
             profile_dir=profile_dir,
         )
+        
+        # Validate credentials
+        self._validate_credentials()
+        
         self.wait = WebDriverWait(self.driver, self.TIMEOUT_STANDARD)
         self.solver = two_captcha
         self.iob_win: Optional[str] = None
         self._captcha_id: Optional[str] = None
         self.captcha_code: Optional[str] = None
+
+    # ============================================================
+    # Validation
+    # ============================================================
+
+    def _validate_credentials(self) -> None:
+        """
+        Validate required credentials are present.
+        
+        Raises:
+            ValueError: If required credentials are missing
+        """
+        required = ["password", "account_number", "bank_label"]
+        missing = [k for k in required if not self.cred.get(k)]
+        
+        if missing:
+            raise ValueError(f"Missing required credentials: {missing}")
+        
+        # Corporate mode requires additional fields
+        if self._is_corporate_mode():
+            corporate_required = ["login_id", "user_id"]
+            missing_corp = [k for k in corporate_required if not self.cred.get(k)]
+            if missing_corp:
+                raise ValueError(
+                    f"Missing corporate credentials: {missing_corp}"
+                )
 
     # ============================================================
     # Main Worker Loop
@@ -146,7 +254,9 @@ class IOBWorker(BaseWorker):
                         
                         # Check stop event before expensive operations
                         if self.stop_evt.is_set():
-                            logger.debug("[%s] Stop event detected - exiting loop", self.alias)
+                            self.worker_logger.debug(
+                                "Stop event detected - exiting loop"
+                            )
                             break
 
                         # Download and upload statement
@@ -154,7 +264,9 @@ class IOBWorker(BaseWorker):
 
                         # Check again before balance enquiry
                         if self.stop_evt.is_set():
-                            logger.debug("[%s] Stop event detected before balance enquiry", self.alias)
+                            self.worker_logger.debug(
+                                "Stop event detected before balance enquiry"
+                            )
                             break
                             
                         self._check_logged_out_and_cycle()
@@ -167,11 +279,13 @@ class IOBWorker(BaseWorker):
                         )
                         
                         if balance_result is None:
-                            logger.debug("[%s] Balance enquiry skipped", self.alias)
+                            self.worker_logger.debug("Balance enquiry skipped")
 
                         # Check stop event before sleep
                         if self.stop_evt.is_set():
-                            logger.debug("[%s] Stop event detected - skipping sleep", self.alias)
+                            self.worker_logger.debug(
+                                "Stop event detected - skipping sleep"
+                            )
                             break
                         
                         # Interruptible sleep
@@ -180,22 +294,21 @@ class IOBWorker(BaseWorker):
                 except TimeoutException as e:
                     # If stop event is set, this is expected - don't log as error
                     if self.stop_evt.is_set():
-                        logger.debug("[%s] Timeout during shutdown (expected)", self.alias)
+                        self.worker_logger.debug(
+                            "Timeout during shutdown (expected)"
+                        )
                         break
                     
                     retry_count += 1
-                    logger.warning(
-                        "[%s] Timeout/logged-out (retry %d/%d): %s",
-                        self.alias,
-                        retry_count,
-                        self.MAX_OUTER_RETRIES,
-                        e
+                    self.warning(
+                        f"Timeout/logged-out (retry {retry_count}/"
+                        f"{self.MAX_OUTER_RETRIES}): {e}"
                     )
                     
                     if retry_count > self.MAX_OUTER_RETRIES:
                         self.error(
                             f"Too many failures ({self.MAX_OUTER_RETRIES}). "
-                            f"Stopping IOB worker."
+                            "Stopping IOB worker."
                         )
                         return
                     
@@ -203,37 +316,28 @@ class IOBWorker(BaseWorker):
                     if not self.stop_evt.is_set():
                         try:
                             self.screenshot_all_tabs(
-                                f"IOB error - retry {retry_count}/{self.MAX_OUTER_RETRIES}"
+                                f"IOB error - retry {retry_count}/"
+                                f"{self.MAX_OUTER_RETRIES}"
                             )
                         except Exception:
                             pass
                     
-                    self._cycle_tabs()
+                    self._reset_session()
                     
                 except Exception as e:
                     # If stop event is set, suppress Selenium connection errors
                     if self.stop_evt.is_set():
-                        error_msg = str(e)
-                        # Check if this is a Selenium connection error during shutdown
-                        if any(indicator in error_msg for indicator in [
-                            "Connection refused",
-                            "Failed to establish a new connection",
-                            "MaxRetryError",
-                            "target machine actively refused",
-                            "invalid session id",
-                            "chrome not reachable",
-                            "Session not created"
-                        ]):
-                            logger.debug(
-                                "[%s] Selenium connection error during shutdown (expected): %s",
-                                self.alias,
+                        if self._is_shutdown_error(e):
+                            self.worker_logger.debug(
+                                "Selenium connection error during shutdown (expected): %s",
                                 type(e).__name__
                             )
                             break
                     
                     retry_count += 1
                     self.error(
-                        f"Loop error (retry {retry_count}/{self.MAX_OUTER_RETRIES}): "
+                        f"Loop error (retry {retry_count}/"
+                        f"{self.MAX_OUTER_RETRIES}): "
                         f"{type(e).__name__}: {e}"
                     )
                     
@@ -247,11 +351,11 @@ class IOBWorker(BaseWorker):
                     if retry_count > self.MAX_OUTER_RETRIES:
                         self.error(
                             f"Too many failures ({self.MAX_OUTER_RETRIES}). "
-                            f"Stopping IOB worker."
+                            "Stopping IOB worker."
                         )
                         return
 
-                    self._cycle_tabs()
+                    self._reset_session()
                     
         finally:
             # Only call stop() if not already stopped
@@ -275,105 +379,18 @@ class IOBWorker(BaseWorker):
         while time.time() < sleep_end and not self.stop_evt.is_set():
             time.sleep(0.5)
 
-    def _cycle_tabs(self) -> None:
+    def _reset_session(self) -> None:
         """
-        Reset browser session by cycling tabs.
+        Reset browser session and IOB-specific state.
         
-        Closes all existing tabs, opens a fresh about:blank tab,
-        and resets login state. Used for recovery from errors
-        or session timeouts.
-        
-        This method is actively used for error recovery throughout
-        the worker lifecycle. Includes protection against shutdown
-        race conditions.
+        Calls BaseWorker's tab cycling logic and resets IOB-specific
+        attributes.
         """
-        # Don't cycle if stop event is set
-        if self.stop_evt.is_set():
-            logger.debug("[%s] Stop event set - skipping tab cycle", self.alias)
-            return
+        super()._cycle_tabs()
         
-        d = self.driver
-        
-        with ErrorContext(
-            "cycling browser tabs",
-            messenger=self.msgr,
-            alias=self.alias,
-            reraise=False
-        ):
-            # Check if driver is still alive
-            try:
-                _ = d.session_id
-            except Exception:
-                logger.debug("[%s] Driver not available for tab cycling", self.alias)
-                return
-            
-            handles_before = safe_operation(
-                lambda: list(d.window_handles),
-                context=f"get window handles for {self.alias}",
-                default=[]
-            )
-            
-            if not handles_before:
-                logger.warning("[%s] No windows to cycle; driver may be closed", self.alias)
-                return
-
-            # Check stop event before proceeding
-            if self.stop_evt.is_set():
-                logger.debug("[%s] Stop event detected during tab cycle prep", self.alias)
-                return
-
-            # Open new blank tab
-            safe_operation(
-                lambda: d.execute_script("window.open('about:blank','_blank');"),
-                context=f"open new tab for {self.alias}",
-                default=None
-            )
-            time.sleep(0.5)
-
-            # Find newly opened handle
-            handles_after = safe_operation(
-                lambda: list(d.window_handles),
-                context=f"get new window handles for {self.alias}",
-                default=handles_before
-            )
-            
-            new_handle = None
-            for h in handles_after:
-                if h not in handles_before:
-                    new_handle = h
-                    break
-
-            if not new_handle:
-                logger.error("[%s] Failed to locate new tab during cycle", self.alias)
-                return
-
-            # Close all old tabs
-            for h in handles_before:
-                # Check stop event before each close operation
-                if self.stop_evt.is_set():
-                    logger.debug("[%s] Stop event detected during tab cleanup", self.alias)
-                    break
-                    
-                try:
-                    d.switch_to.window(h)
-                    d.close()
-                except Exception as e:
-                    logger.debug("[%s] Failed to close old tab: %s", self.alias, e)
-
-            # Switch to fresh tab and reset state
-            try:
-                d.switch_to.window(new_handle)
-                self.iob_win = new_handle
-                self.captcha_code = None
-                self.logged_in = False
-                self.info("Browser tabs cycled - will re-login on next loop")
-            except Exception as e:
-                # If stop event is set, this is expected
-                if self.stop_evt.is_set():
-                    logger.debug("[%s] Tab switch interrupted by stop event", self.alias)
-                else:
-                    logger.error("[%s] Failed to switch to new tab: %s", self.alias, e)
-                    self.stop_evt.set()
+        # Reset IOB-specific state
+        self.iob_win = None
+        self.captcha_code = None
 
     def _check_logged_out_and_cycle(self) -> None:
         """
@@ -396,10 +413,33 @@ class IOBWorker(BaseWorker):
             default=""
         )
         
-        if source and "You are Logged OUT of internet banking" in source:
-            self.info("Detected logged-out page; cycling tabs and retrying login")
-            self._cycle_tabs()
+        if source and self.ERROR_LOGGED_OUT in source:
+            self.info("Detected logged-out page - resetting session")
+            self._reset_session()
             raise TimeoutException("IOB logged out (server message)")
+
+    def _is_shutdown_error(self, error: Exception) -> bool:
+        """
+        Check if error is expected during shutdown.
+        
+        Args:
+            error: Exception to check
+            
+        Returns:
+            True if error is expected during shutdown
+        """
+        error_msg = str(error)
+        shutdown_indicators = [
+            "Connection refused",
+            "Failed to establish a new connection",
+            "MaxRetryError",
+            "target machine actively refused",
+            "invalid session id",
+            "chrome not reachable",
+            "Session not created",
+        ]
+        
+        return any(indicator in error_msg for indicator in shutdown_indicators)
 
     # ============================================================
     # Login Flow
@@ -420,10 +460,11 @@ class IOBWorker(BaseWorker):
         Raises:
             RuntimeError: If login fails
             TimeoutException: If page elements not found
+            ValueError: If credentials are invalid
         """
         # Check stop event before login attempt
         if self.stop_evt.is_set():
-            logger.debug("[%s] Stop event set - skipping login", self.alias)
+            self.worker_logger.debug("Stop event set - skipping login")
             return
         
         d = self.driver
@@ -431,21 +472,39 @@ class IOBWorker(BaseWorker):
 
         # Determine login mode
         is_corp = self._is_corporate_mode()
-        role_text = "Corporate Login" if is_corp else "Personal Login"
+        mode_text = "corporate" if is_corp else "retail"
 
-        with ErrorContext("IOB login", messenger=self.msgr, alias=self.alias):
+        with ErrorContext(
+            "IOB login",
+            messenger=self.msgr,
+            alias=self.alias,
+            metadata=ErrorMetadata(
+                category=ErrorCategory.BANKING,
+                severity=ErrorSeverity.HIGH,
+                worker_alias=self.alias,
+                bank_name=self.cred.get("bank_label"),
+                operation="login",
+                recoverable=True,
+            )
+        ):
             # Navigate to login page
             d.get(self.LOGIN_URL)
 
             # Click continue to internet banking
             w.until(
                 EC.element_to_be_clickable(
-                    (By.LINK_TEXT, "Continue to Internet Banking Home Page")
+                    (By.LINK_TEXT, self.NAV_CONTINUE_TEXT)
                 )
             ).click()
 
             # Select login mode
-            w.until(EC.element_to_be_clickable((By.LINK_TEXT, role_text))).click()
+            role_text = (
+                self.NAV_CORPORATE_LOGIN if is_corp 
+                else self.NAV_PERSONAL_LOGIN
+            )
+            w.until(
+                EC.element_to_be_clickable((By.LINK_TEXT, role_text))
+            ).click()
 
             # Fill credentials
             self._fill_login_credentials(is_corp)
@@ -454,10 +513,25 @@ class IOBWorker(BaseWorker):
             self._solve_and_submit_captcha()
 
             # Wait for successful login
-            w.until(EC.presence_of_element_located((By.CSS_SELECTOR, "nav.accordian")))
+            w.until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "nav.accordian"))
+            )
+            
             self.iob_win = d.current_window_handle
             self.logged_in = True
-            self.info("Logged in to IOB successfully")
+            
+            self.info(f"Logged in successfully ({mode_text} mode)")
+            
+            # Audit log
+            log_audit_event(
+                "LOGIN_SUCCESS",
+                {
+                    "alias": self.alias,
+                    "bank": self.cred.get("bank_label"),
+                    "account": f"***{self.cred['account_number'][-4:]}",
+                    "mode": mode_text,
+                }
+            )
 
     def _is_corporate_mode(self) -> bool:
         """
@@ -499,67 +573,77 @@ class IOBWorker(BaseWorker):
                 )
             else:
                 # Retail: loginId + password
-                user = self.cred.get("auth_id") or self.cred.get("username") or ""
+                user = (
+                    self.cred.get("auth_id") or 
+                    self.cred.get("username") or 
+                    ""
+                )
                 d.find_element(By.NAME, "loginId").send_keys(user)
-                d.find_element(By.NAME, "password").send_keys(self.cred["password"])
+                d.find_element(By.NAME, "password").send_keys(
+                    self.cred["password"]
+                )
 
-def _solve_and_submit_captcha(self) -> None:
-    """
-    Solve CAPTCHA and submit login form.
-    
-    Attempts automatic solving via 2Captcha. Falls back to manual
-    solving via Telegram if automatic fails.
-    
-    Raises:
-        TimeoutException: If CAPTCHA solving fails or is incorrect
-    """
-    # Skip if stopping
-    if self.stop_evt.is_set():
-        logger.debug("[%s] Stop event set - skipping CAPTCHA solve", self.alias)
-        return
-    
-    d = self.driver
-    
-    with ErrorContext("solving CAPTCHA", messenger=self.msgr, alias=self.alias):
-        # Capture CAPTCHA image
-        img = WebDriverWait(d, self.TIMEOUT_CAPTCHA_WAIT).until(
-            EC.presence_of_element_located((By.ID, "captchaimg"))
-        )
+    def _solve_and_submit_captcha(self) -> None:
+        """
+        Solve CAPTCHA and submit login form.
         
-        # Scroll into view
-        d.execute_script("arguments[0].scrollIntoView(true);", img)
-        time.sleep(1)
-
-        # Re-locate after scroll
-        img = WebDriverWait(d, self.TIMEOUT_CAPTCHA_WAIT).until(
-            EC.visibility_of_element_located((By.ID, "captchaimg"))
-        )
-        img_bytes = img.screenshot_as_png
-
-        # Attempt automatic solving
-        solution = self._solve_captcha_automatic(img_bytes)
+        Attempts automatic solving via 2Captcha. Falls back to manual
+        solving via Telegram if automatic fails.
         
-        if not solution:
-            # Fallback to manual solving via Telegram
-            self.msgr.send_photo(
-                BytesIO(img_bytes),
-                f"[{self.alias}] Please solve CAPTCHA for IOB login",
-                kind="CAPTCHA",
+        Raises:
+            TimeoutException: If CAPTCHA solving fails or is incorrect
+        """
+        # Skip if stopping
+        if self.stop_evt.is_set():
+            self.worker_logger.debug("Stop event set - skipping CAPTCHA solve")
+            return
+        
+        d = self.driver
+        
+        with ErrorContext(
+            "solving CAPTCHA",
+            messenger=self.msgr,
+            alias=self.alias
+        ):
+            # Capture CAPTCHA image
+            img = WebDriverWait(d, self.TIMEOUT_CAPTCHA_WAIT).until(
+                EC.presence_of_element_located((By.ID, self.CAPTCHA_IMAGE_ID))
             )
-            raise TimeoutException(
-                "CAPTCHA not solved automatically - manual entry required"
+            
+            # Scroll into view
+            d.execute_script("arguments[0].scrollIntoView(true);", img)
+            time.sleep(1)
+
+            # Re-locate after scroll
+            img = WebDriverWait(d, self.TIMEOUT_CAPTCHA_WAIT).until(
+                EC.visibility_of_element_located((By.ID, self.CAPTCHA_IMAGE_ID))
             )
+            img_bytes = img.screenshot_as_png
 
-        # Fill CAPTCHA
-        field = d.find_element(By.NAME, "captchaid")
-        field.clear()
-        field.send_keys(solution.strip().upper())
+            # Attempt automatic solving
+            solution = self._solve_captcha_automatic(img_bytes)
+            
+            if not solution:
+                # Fallback to manual solving via Telegram
+                self.msgr.send_photo(
+                    BytesIO(img_bytes),
+                    f"[{self.alias}] Please solve CAPTCHA for IOB login",
+                    kind="CAPTCHA",
+                )
+                raise TimeoutException(
+                    "CAPTCHA not solved automatically - manual entry required"
+                )
 
-        # Submit form
-        d.find_element(By.ID, "btnSubmit").click()
+            # Fill CAPTCHA
+            field = d.find_element(By.NAME, self.CAPTCHA_FIELD_NAME)
+            field.clear()
+            field.send_keys(solution.strip().upper())
 
-        # Check for incorrect CAPTCHA error (with stop event protection)
-        self._check_captcha_error()
+            # Submit form
+            d.find_element(By.ID, self.SUBMIT_BUTTON_ID).click()
+
+            # Check for incorrect CAPTCHA error (with stop event protection)
+            self._check_captcha_error()
 
     def _solve_captcha_automatic(self, img_bytes: bytes) -> Optional[str]:
         """
@@ -599,63 +683,66 @@ def _solve_and_submit_captcha(self) -> None:
         
         return None
 
-def _check_captcha_error(self) -> None:
-    """
-    Check for incorrect CAPTCHA error message.
-    
-    Raises:
-        TimeoutException: If CAPTCHA was incorrect
-    """
-    # Skip check if stopping
-    if self.stop_evt.is_set():
-        logger.debug("[%s] Stop event set - skipping CAPTCHA error check", self.alias)
-        return
-    
-    d = self.driver
-    
-    try:
-        # Check if driver session is still valid
-        try:
-            _ = d.session_id
-        except Exception:
-            # Driver session is dead - likely due to stop event
-            logger.debug("[%s] Driver session invalid - skipping CAPTCHA check", self.alias)
+    def _check_captcha_error(self) -> None:
+        """
+        Check for incorrect CAPTCHA error message.
+        
+        Raises:
+            TimeoutException: If CAPTCHA was incorrect
+        """
+        # Skip check if stopping
+        if self.stop_evt.is_set():
+            self.worker_logger.debug(
+                "Stop event set - skipping CAPTCHA error check"
+            )
             return
         
-        err_span = WebDriverWait(d, self.TIMEOUT_ERROR_DETECTION).until(
-            EC.presence_of_element_located(
-                (By.CSS_SELECTOR, "div.otpmsg span.red")
-            )
-        )
+        d = self.driver
         
-        if (
-            "captcha entered is incorrect" in (err_span.text or "").lower()
-            and self._captcha_id
-        ):
-            self.error("CAPTCHA incorrect - reporting to 2Captcha and retrying")
-            if self.solver:
-                safe_operation(
-                    lambda: self.solver.report_bad(self._captcha_id),
-                    context="report bad CAPTCHA",
-                    default=None
+        try:
+            # Check if driver session is still valid
+            try:
+                _ = d.session_id
+            except Exception:
+                # Driver session is dead - likely due to stop event
+                self.worker_logger.debug(
+                    "Driver session invalid - skipping CAPTCHA check"
                 )
-            self._cycle_tabs()
-            raise TimeoutException("CAPTCHA incorrect")
+                return
             
-    except TimeoutException:
-        # No error shown - login successful
-        pass
-    except Exception as e:
-        # If stop event is set, suppress all errors
-        if self.stop_evt.is_set():
-            logger.debug(
-                "[%s] Exception during CAPTCHA check (shutdown in progress): %s",
-                self.alias,
-                type(e).__name__
+            err_span = WebDriverWait(d, self.TIMEOUT_ERROR_DETECTION).until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, "div.otpmsg span.red")
+                )
             )
-        else:
-            # Re-raise unexpected errors during normal operation
-            raise
+            
+            if (
+                self.ERROR_CAPTCHA_INCORRECT in (err_span.text or "").lower()
+                and self._captcha_id
+            ):
+                self.error("CAPTCHA incorrect - reporting to 2Captcha")
+                if self.solver:
+                    safe_operation(
+                        lambda: self.solver.report_bad(self._captcha_id),
+                        context="report bad CAPTCHA",
+                        default=None
+                    )
+                self._reset_session()
+                raise TimeoutException("CAPTCHA incorrect")
+                
+        except TimeoutException:
+            # No error shown - login successful
+            pass
+        except Exception as e:
+            # If stop event is set, suppress all errors
+            if self.stop_evt.is_set():
+                self.worker_logger.debug(
+                    "Exception during CAPTCHA check (shutdown in progress): %s",
+                    type(e).__name__
+                )
+            else:
+                # Re-raise unexpected errors during normal operation
+                raise
 
     # ============================================================
     # Statement Download and Upload
@@ -672,20 +759,27 @@ def _check_captcha_error(self) -> None:
         4. View and export statement as CSV
         5. Upload to CipherBank with retries
         
-        Uses CipherBank for statement processing. AutoBank upload
-        is deprecated and has been removed.
+        Uses CipherBank for statement processing.
         """
         # Check stop event before starting
         if self.stop_evt.is_set():
-            logger.debug("[%s] Stop event set - skipping statement download", self.alias)
+            self.worker_logger.debug(
+                "Stop event set - skipping statement download"
+            )
             return
         
-        d = self.driver
-
         with ErrorContext(
             "downloading and uploading statement",
             messenger=self.msgr,
-            alias=self.alias
+            alias=self.alias,
+            metadata=ErrorMetadata(
+                category=ErrorCategory.BANKING,
+                severity=ErrorSeverity.HIGH,
+                worker_alias=self.alias,
+                bank_name=self.cred.get("bank_label"),
+                operation="statement_download",
+                recoverable=True,
+            )
         ):
             # Navigate to Account Statement
             self._navigate_to_account_statement()
@@ -703,6 +797,18 @@ def _check_captcha_error(self) -> None:
             # Export CSV
             csv_path = self._export_statement_csv()
 
+            # Audit log
+            log_audit_event(
+                "STATEMENT_DOWNLOAD",
+                {
+                    "alias": self.alias,
+                    "bank": self.cred.get("bank_label"),
+                    "file": os.path.basename(csv_path),
+                    "size_kb": round(os.path.getsize(csv_path) / 1024, 2),
+                    "date_range": f"{from_str} to {to_str}",
+                }
+            )
+
             # Upload to CipherBank
             self._upload_to_cipherbank(csv_path)
 
@@ -711,7 +817,7 @@ def _check_captcha_error(self) -> None:
         d = self.driver
         
         stmt_link = WebDriverWait(d, self.TIMEOUT_LONG).until(
-            EC.element_to_be_clickable((By.LINK_TEXT, "Account statement"))
+            EC.element_to_be_clickable((By.LINK_TEXT, self.NAV_ACCOUNT_STATEMENT))
         )
         self._safe_click(stmt_link)
         time.sleep(3)
@@ -719,7 +825,7 @@ def _check_captcha_error(self) -> None:
     def _select_account(self) -> None:
         """Select target account from dropdown."""
         acct_sel = self.wait.until(
-            EC.element_to_be_clickable((By.ID, "accountNo"))
+            EC.element_to_be_clickable((By.ID, self.ACCOUNT_DROPDOWN_ID))
         )
         dropdown = Select(acct_sel)
         acct_no = (self.cred.get("account_number") or "").strip()
@@ -748,9 +854,8 @@ def _check_captcha_error(self) -> None:
         from_str = from_dt.strftime("%m/%d/%Y")
         to_str = to_dt.strftime("%m/%d/%Y")
         
-        logger.debug(
-            "[%s] Date range: %s to %s",
-            self.alias,
+        self.worker_logger.debug(
+            "Date range: %s to %s",
             from_str,
             to_str
         )
@@ -767,26 +872,44 @@ def _check_captcha_error(self) -> None:
         """
         d = self.driver
         
-        # Set From Date
-        from_input = self.wait.until(
-            EC.presence_of_element_located((By.ID, "fromDate"))
-        )
-        d.execute_script("arguments[0].removeAttribute('readonly')", from_input)
-        d.execute_script("arguments[0].value = arguments[1]", from_input, from_str)
+        with ErrorContext(
+            "setting date range",
+            messenger=self.msgr,
+            alias=self.alias,
+            reraise=True
+        ):
+            # Set From Date
+            from_input = self.wait.until(
+                EC.presence_of_element_located((By.ID, self.FROM_DATE_ID))
+            )
+            d.execute_script(
+                "arguments[0].removeAttribute('readonly')",
+                from_input
+            )
+            d.execute_script(
+                "arguments[0].value = arguments[1]",
+                from_input,
+                from_str
+            )
 
-        # Set To Date
-        to_input = self.wait.until(
-            EC.presence_of_element_located((By.ID, "toDate"))
-        )
-        d.execute_script("arguments[0].removeAttribute('readonly')", to_input)
-        d.execute_script("arguments[0].value = arguments[1]", to_input, to_str)
+            # Set To Date
+            to_input = self.wait.until(
+                EC.presence_of_element_located((By.ID, self.TO_DATE_ID))
+            )
+            d.execute_script(
+                "arguments[0].removeAttribute('readonly')",
+                to_input
+            )
+            d.execute_script(
+                "arguments[0].value = arguments[1]",
+                to_input,
+                to_str
+            )
 
     def _click_view_statement(self) -> None:
         """Click View button to display statement."""
-        d = self.driver
-        
         view_btn = self.wait.until(
-            EC.element_to_be_clickable((By.ID, "accountstatement_view"))
+            EC.element_to_be_clickable((By.ID, self.VIEW_BUTTON_ID))
         )
         self._safe_click(view_btn)
 
@@ -803,7 +926,7 @@ def _check_captcha_error(self) -> None:
         d = self.driver
         
         csv_btn = WebDriverWait(d, self.TIMEOUT_STANDARD).until(
-            EC.element_to_be_clickable((By.ID, "accountstatement_csvAcctStmt"))
+            EC.element_to_be_clickable((By.ID, self.CSV_BUTTON_ID))
         )
         self._safe_click(csv_btn)
 
@@ -828,27 +951,26 @@ def _check_captcha_error(self) -> None:
         """
         # Skip upload if stopping
         if self.stop_evt.is_set():
-            logger.debug("[%s] Stop event set - skipping CipherBank upload", self.alias)
+            self.worker_logger.debug(
+                "Stop event set - skipping CipherBank upload"
+            )
             return
         
         max_attempts = 5
         cipherbank = get_cipherbank_client()
         
         if not cipherbank:
-            logger.debug(
-                "[%s] CipherBank client not available - skipping upload",
-                self.alias
+            self.worker_logger.debug(
+                "CipherBank client not available - skipping upload"
             )
             return
 
         for attempt in range(1, max_attempts + 1):
             # Check stop event before each attempt
             if self.stop_evt.is_set():
-                logger.debug(
-                    "[%s] Stop event set - aborting CipherBank upload (attempt %d/%d)",
-                    self.alias,
-                    attempt,
-                    max_attempts
+                self.worker_logger.debug(
+                    "Stop event set - aborting CipherBank upload "
+                    f"(attempt {attempt}/{max_attempts})"
                 )
                 return
             
@@ -864,14 +986,31 @@ def _check_captcha_error(self) -> None:
                     file_path=csv_path,
                     alias=self.alias,
                 )
+                
                 self.info(
-                    f"CipherBank upload successful (attempt {attempt}/{max_attempts})"
+                    f"CipherBank upload successful "
+                    f"(attempt {attempt}/{max_attempts})"
                 )
+                
+                # Audit log
+                log_audit_event(
+                    "STATEMENT_UPLOAD",
+                    {
+                        "alias": self.alias,
+                        "bank": self.cred.get("bank_label"),
+                        "service": "CipherBank",
+                        "file": os.path.basename(csv_path),
+                        "attempt": attempt,
+                    }
+                )
+                
                 return  # Success
             
             # Retry delay
             if attempt < max_attempts:
-                logger.info("[%s] Retrying CipherBank upload in 2 seconds...", self.alias)
+                self.info(
+                    f"Retrying CipherBank upload in 2 seconds..."
+                )
                 time.sleep(2)
 
         # All attempts failed
@@ -892,13 +1031,16 @@ def _check_captcha_error(self) -> None:
         1. Navigate to Balance Enquiry page
         2. Click account link
         3. Read balance from popup
-        4. Close popup and return to Account Statement
+        4. Check against thresholds
+        5. Close popup and return to Account Statement
         
         This is a best-effort operation - failures won't crash the worker.
         """
         # Skip if stopping
         if self.stop_evt.is_set():
-            logger.debug("[%s] Stop event set - skipping balance enquiry", self.alias)
+            self.worker_logger.debug(
+                "Stop event set - skipping balance enquiry"
+            )
             return
         
         d = self.driver
@@ -915,7 +1057,9 @@ def _check_captcha_error(self) -> None:
 
             # Navigate to Balance Enquiry
             balance_link = WebDriverWait(d, self.TIMEOUT_LONG).until(
-                EC.element_to_be_clickable((By.LINK_TEXT, "Balance Enquiry"))
+                EC.element_to_be_clickable(
+                    (By.LINK_TEXT, self.NAV_BALANCE_ENQUIRY)
+                )
             )
             self._safe_click(balance_link)
 
@@ -959,7 +1103,7 @@ def _check_captcha_error(self) -> None:
         self._safe_click(acct_link)
 
     def _read_balance_popup(self) -> None:
-        """Read balance from popup dialog."""
+        """Read balance from popup dialog and check thresholds."""
         d = self.driver
         
         tbl = WebDriverWait(d, self.TIMEOUT_EXTRA_LONG).until(
@@ -971,14 +1115,47 @@ def _check_captcha_error(self) -> None:
         
         available = (tbl.text or "").strip()
         if available:
-            self.info(f"💰: {available}")
+            self.info(f"Balance: {available}")
             self.last_balance = available
+            
+            # Check thresholds and alert if necessary
+            self._check_balance_thresholds(available)
+
+    def _check_balance_thresholds(self, balance_text: str) -> None:
+        """
+        Check balance against configured thresholds.
+        
+        Args:
+            balance_text: Balance text from bank (e.g., "₹50,000.00")
+        """
+        amount = parse_balance_amount(balance_text)
+        
+        if not amount:
+            return
+        
+        # Find the highest threshold exceeded
+        for threshold in sorted(THRESHOLDS, key=lambda t: t.min_amount, reverse=True):
+            if amount >= threshold.min_amount:
+                urgency_emoji = {
+                    "LOW": "ℹ️",
+                    "LOW-MEDIUM": "⚠️",
+                    "MEDIUM": "⚠️",
+                    "HIGH": "🚨",
+                    "CRITICAL": "🔴",
+                }.get(threshold.urgency, "⚠️")
+                
+                self.warning(
+                    f"{urgency_emoji} Balance {balance_text} exceeds "
+                    f"₹{threshold.min_amount:,.0f} threshold "
+                    f"({threshold.urgency} urgency)"
+                )
+                break
 
     # ============================================================
     # Helper Methods
     # ============================================================
 
-    def _safe_click(self, element) -> None:
+    def _safe_click(self, element: WebElement) -> None:
         """
         Click element with fallback to JavaScript click.
         
@@ -991,14 +1168,41 @@ def _check_captcha_error(self) -> None:
         d = self.driver
         
         # Scroll into view
-        d.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
+        d.execute_script(
+            "arguments[0].scrollIntoView({block:'center'});",
+            element
+        )
         time.sleep(0.3)
         
         try:
             element.click()
         except ElementClickInterceptedException:
-            logger.debug("[%s] Click intercepted - using JavaScript", self.alias)
+            self.worker_logger.debug("Click intercepted - using JavaScript")
             d.execute_script("arguments[0].click();", element)
         except Exception:
             # Last resort - force JavaScript click
             d.execute_script("arguments[0].click();", element)
+
+    # ============================================================
+    # Health Check
+    # ============================================================
+
+    def health_check(self) -> dict:
+        """
+        Return worker health status.
+        
+        Returns:
+            Dict with health metrics
+        """
+        return {
+            "alias": self.alias,
+            "logged_in": self.logged_in,
+            "last_balance": self.last_balance,
+            "stop_event_set": self.stop_evt.is_set(),
+            "driver_alive": safe_operation(
+                lambda: bool(self.driver.session_id),
+                context="check driver status",
+                default=False
+            ),
+            "mode": "corporate" if self._is_corporate_mode() else "retail",
+        }
